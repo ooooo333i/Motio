@@ -732,7 +732,7 @@ def estimate_hand_boxes_from_coco17(
 
         wrist_xy = wrist[:2]
         center = wrist_xy.copy()
-        box_size = 0.12 * max(width, height)
+        box_size = 0.06 * max(width, height)
 
         if elbow_idx < len(kp):
             elbow = kp[elbow_idx]
@@ -741,8 +741,8 @@ def estimate_hand_boxes_from_coco17(
                 forearm = wrist_xy - elbow[:2]
                 forearm_len = float(np.linalg.norm(forearm))
                 if forearm_len > 1.0:
-                    center = wrist_xy + 0.35 * forearm
-                    box_size = max(box_size, 1.6 * forearm_len)
+                    center = wrist_xy + 0.25 * forearm
+                    box_size = max(box_size, 1.0 * forearm_len)
 
         x1 = max(0.0, float(center[0] - box_size / 2))
         y1 = max(0.0, float(center[1] - box_size / 2))
@@ -752,6 +752,157 @@ def estimate_hand_boxes_from_coco17(
             continue
         boxes.append([x1, y1, x2, y2])
         is_right.append(right_flag)
+
+    return boxes, is_right
+
+
+# COCO-WholeBody index ranges for hands (0-indexed in the 133-kp output)
+_WHOLEBODY_LEFT_HAND_SLICE  = slice(91, 112)   # indices 91-111 inclusive (21 kp)
+_WHOLEBODY_RIGHT_HAND_SLICE = slice(112, 133)  # indices 112-132 inclusive (21 kp)
+_WHOLEBODY_MIN_VALID_KP = 4  # minimum confident keypoints required for tight bbox
+
+
+def estimate_hand_boxes_from_wholebody133(
+    keypoints: Any,
+    width: int,
+    height: int,
+    min_conf: float,
+    fallback_kp2d: Any = None,
+) -> tuple["list[list[float]]", "list[int]"]:
+    """Build HaMeR bbox from ViTPose-wholebody 133-keypoint output.
+
+    keypoints: array-like [133, 3] (x, y, conf) in full-image pixel coords.
+    Falls back to estimate_hand_boxes_from_coco17() if fallback_kp2d is provided
+    and hand keypoints are insufficient.
+    """
+    import numpy as np
+
+    kp = np.asarray(keypoints, dtype=np.float32)
+    if kp.ndim != 2 or kp.shape[0] < 133 or kp.shape[1] < 2:
+        if fallback_kp2d is not None:
+            return estimate_hand_boxes_from_coco17(fallback_kp2d, width, height, min_conf)
+        return [], []
+
+    boxes: list[list[float]] = []
+    is_right: list[int] = []
+
+    for hand_slice, right_flag in [
+        (_WHOLEBODY_LEFT_HAND_SLICE,  0),
+        (_WHOLEBODY_RIGHT_HAND_SLICE, 1),
+    ]:
+        hand_kp = kp[hand_slice]  # (21, 3)
+        conf = hand_kp[:, 2] if hand_kp.shape[1] > 2 else np.ones(len(hand_kp))
+        valid = hand_kp[conf >= min_conf]
+
+        if len(valid) < _WHOLEBODY_MIN_VALID_KP:
+            # fall back to coco17 for this hand only
+            if fallback_kp2d is not None:
+                # re-use the per-hand portion of the coco17 fallback
+                fb_boxes, fb_right = estimate_hand_boxes_from_coco17(
+                    fallback_kp2d, width, height, min_conf
+                )
+                for b, r in zip(fb_boxes, fb_right):
+                    if r == right_flag:
+                        boxes.append(b)
+                        is_right.append(r)
+            continue
+
+        x1 = float(np.clip(valid[:, 0].min(), 0, width - 1))
+        y1 = float(np.clip(valid[:, 1].min(), 0, height - 1))
+        x2 = float(np.clip(valid[:, 0].max(), 0, width - 1))
+        y2 = float(np.clip(valid[:, 1].max(), 0, height - 1))
+
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            continue
+
+        boxes.append([x1, y1, x2, y2])
+        is_right.append(right_flag)
+
+    return boxes, is_right
+
+
+# COCO17 wrist indices for left/right assignment of YOLO hand detections
+_COCO17_LEFT_WRIST  = 9
+_COCO17_RIGHT_WRIST = 10
+# Maximum distance (px) from wrist to bbox center for a valid assignment
+_YOLO_WRIST_MAX_DIST = 400.0
+
+
+def estimate_hand_boxes_from_yolo(
+    yolo_detections: "list[list[float]]",
+    yolo_confs: "list[float]",
+    kp2d_coco17: Any,
+    width: int,
+    height: int,
+    min_yolo_conf: float = 0.3,
+    min_wrist_conf: float = 0.2,
+    fallback_kp2d: Any = None,
+) -> tuple["list[list[float]]", "list[int]"]:
+    """Assign YOLO hand bboxes to left/right using COCO17 wrist proximity.
+
+    yolo_detections: list of [x1, y1, x2, y2] in pixel coords.
+    yolo_confs:      detection confidence per box.
+    kp2d_coco17:     array [17, 3] (x, y, conf) in pixel coords.
+    Returns (boxes, is_right) in the same format as estimate_hand_boxes_from_coco17.
+    Falls back to estimate_hand_boxes_from_coco17 if no YOLO detections pass threshold.
+    """
+    import numpy as np
+
+    kp = np.asarray(kp2d_coco17, dtype=np.float32) if kp2d_coco17 is not None else None
+
+    # Filter by confidence
+    valid_dets = [
+        (box, conf)
+        for box, conf in zip(yolo_detections, yolo_confs)
+        if conf >= min_yolo_conf
+    ]
+
+    if not valid_dets:
+        if fallback_kp2d is not None:
+            return estimate_hand_boxes_from_coco17(fallback_kp2d, width, height, min_wrist_conf)
+        return [], []
+
+    # Extract wrist positions from COCO17
+    left_wrist  = None if kp is None else kp[_COCO17_LEFT_WRIST]
+    right_wrist = None if kp is None else kp[_COCO17_RIGHT_WRIST]
+
+    def _wrist_ok(w):
+        return w is not None and (kp.shape[1] < 3 or float(w[2]) >= min_wrist_conf)
+
+    boxes: list[list[float]] = []
+    is_right: list[int] = []
+    assigned_sides: set = set()
+
+    # Score each detection against each wrist
+    candidates = []
+    for box, conf in valid_dets:
+        cx = (box[0] + box[2]) / 2.0
+        cy = (box[1] + box[3]) / 2.0
+        for side_flag, wrist in ((0, left_wrist), (1, right_wrist)):
+            if not _wrist_ok(wrist):
+                continue
+            dist = float(np.linalg.norm(np.array([cx, cy]) - wrist[:2]))
+            if dist <= _YOLO_WRIST_MAX_DIST:
+                candidates.append((dist, side_flag, box, conf))
+
+    # Greedy assignment: closest detection wins each side
+    candidates.sort(key=lambda x: x[0])
+    for dist, side_flag, box, conf in candidates:
+        if side_flag in assigned_sides:
+            continue
+        assigned_sides.add(side_flag)
+        x1, y1, x2, y2 = box
+        boxes.append([float(x1), float(y1), float(x2), float(y2)])
+        is_right.append(side_flag)
+
+    # Fallback for any side that had no valid YOLO match
+    if fallback_kp2d is not None:
+        fb_boxes, fb_right = estimate_hand_boxes_from_coco17(fallback_kp2d, width, height, min_wrist_conf)
+        for b, r in zip(fb_boxes, fb_right):
+            if r not in assigned_sides:
+                boxes.append(b)
+                is_right.append(r)
+                assigned_sides.add(r)
 
     return boxes, is_right
 

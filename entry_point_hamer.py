@@ -707,6 +707,16 @@ def run_hamer_from_gvhmr_keypoints_debug(
             wholebody_kp2d, wholebody_tic = _extract_wholebody_kp2d(
                 frame_dir, kp2d, bbx_path, hamer_root, min_conf
             )
+            # Cache wholebody 2D for downstream wrist fitting (per-clip, generalizes).
+            if wholebody_kp2d is not None:
+                _pp_dir = bbx_path.parent if bbx_path is not None else (frame_dir.parent / 'preprocess')
+                _pp_dir.mkdir(parents=True, exist_ok=True)
+                _wb_out = _pp_dir / 'wholebody_kp2d.npy'
+                try:
+                    np.save(str(_wb_out), wholebody_kp2d)
+                    print(f"[CAP] Saved wholebody_kp2d -> {_wb_out}")
+                except Exception as _wb_exc:
+                    print(f"[CAP] Warning: failed to save wholebody_kp2d ({_wb_exc})")
 
         # Optionally pre-run YOLO hand detector across all frames.
         yolo_dets_per_frame = None
@@ -1099,6 +1109,13 @@ def main() -> None:
     report["pipeline_total_fps"] = frame_count / report["pipeline_total_sec"] if report["pipeline_total_sec"] > 0 else 0.0
     # Update the JSON report with final timing — no need to re-run the merge for this.
     merged_path.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    # Optional early exit: skip legacy Stage A/B wrist refine + 3-variant renders
+    # (used by the generalized batch pipeline which does its own wrist fitting).
+    if os.environ.get("CAP_SKIP_WRIST_REFINE") == "1":
+        print(f"[CAP] CAP_SKIP_WRIST_REFINE=1 -> stopping after merge: {merged_path}")
+        print(f"[CAP] Runtime total: {report['pipeline_total_sec']:.2f}s")
+        return
 
     # === Wrist Refine (Stage A + Stage B) ===
     # merged_path = smplx_merged_hamer_post.pt  (baseline — do NOT overwrite)

@@ -29,7 +29,11 @@ from scipy.spatial.transform import Rotation
 MODE = os.environ.get("CAP_INJECT_MODE", "swing")
 
 # ── 경로 ─────────────────────────────────────────────────
-INPUT_PT = "/workspace/capstone_deploy/outputs/cap_pipeline/input/smplx_kalman_B.pt"
+# base(.pt) — 손목/팔/손가락의 출발점. CAP_INPUT_PT로 오버라이드.
+#   기본 smplx_kalman_B.pt (arm-prefit + HaMeR 손목 + kalman)
+#   버전 A(entry_point_hamer 스타일)는 hmr4d_results.pt (raw GVHMR 손목) 사용 권장.
+INPUT_PT = os.environ.get("CAP_INPUT_PT",
+    "/workspace/capstone_deploy/outputs/cap_pipeline/input/smplx_kalman_B.pt")
 if MODE == "full":
     OUTPUT_PT = "/workspace/capstone_deploy/outputs/cap_pipeline/input/smplx_hmp_injected_full.pt"
     NPZ_RIGHT = "/workspace/hmp_test/optim/in_the_wild_sample_config/in_the_wild/tennis_full/recon_000_30fps.npz"
@@ -101,10 +105,16 @@ def vid_f_to_hmp_t(vid_f: int) -> int:
 def inject_wrist_from_hmp(pt_data: dict,
                            npz_right: np.lib.npyio.NpzFile,
                            npz_left: np.lib.npyio.NpzFile,
-                           inject_hand_pose: bool = True) -> dict:
+                           inject_hand_pose: bool = True,
+                           inject_wrist: bool = True,
+                           hand_postprocess: bool = True) -> dict:
     """
-    wrist(body_pose[19/20])  ← HMP poses[:,:3]  (HaMeR보다 정확)
-    hand_pose(그립)           ← HaMeR 원본       (HMP prior가 테니스 그립을 망가뜨림)
+    wrist(body_pose[19/20])  ← HMP poses[:,:3]  (HaMeR보다 정확)   [inject_wrist=True일 때]
+    hand_pose(그립)           ← HaMeR + 시계열 후처리 (entry_point_hamer와 동일)
+
+    inject_wrist=False → wrist는 base(pt_data) 그대로 유지 (버전 A: 손목 최적화 X).
+    hand_postprocess=True → postprocess_hand_sequence (temporal gate + outlier + fill + smooth)
+       적용. False면 원본 HaMeR hand_pose 직접 사용 (구 동작).
 
     핵심: R_local 계산은 INCAM 공간에서만 수행.
     body_pose는 local rotation이므로 global/incam에 동일값 적용.
@@ -123,8 +133,22 @@ def inject_wrist_from_hmp(pt_data: dict,
 
     # HaMeR 원본: hand_pose 용
     _hamer_out_dir = _Path('/workspace/capstone_deploy/outputs/cap_pipeline/input/hamer_out_clean')
-    det_all = load_hamer_detections_full(_hamer_out_dir, SWING_END + 10)
+    NF = pt_data["smpl_params_incam"]["body_pose"].shape[0]
+    det_all = load_hamer_detections_full(_hamer_out_dir, NF)
     # det_all['right'][vid_f]['hand_pose'] : (45,) axis-angle, already mirrored for left
+
+    # ── 손가락 시계열 후처리 (entry_point_hamer.postprocess_hand_sequence 복원) ──
+    # 전체 프레임 시퀀스로 후처리 → 스무딩 temporal context 확보. 결과는 (NF,45).
+    hp_processed = {"right": None, "left": None}
+    if inject_hand_pose and hand_postprocess:
+        from entry_point_hamer import postprocess_hand_sequence, HandPostprocessConfig
+        _cfg = HandPostprocessConfig()
+        for _side in ("right", "left"):
+            _dd = {f: det_all[_side][f]['hand_pose'].reshape(45)
+                   for f in range(NF) if det_all[_side].get(f) is not None}
+            _fallback = np.zeros((NF, 45), dtype=np.float32)
+            _proc, _ = postprocess_hand_sequence(_dd, _fallback, _cfg)
+            hp_processed[_side] = _proc   # (NF,45) 후처리된 hand_pose (convention 유지)
 
     import smplx as _smplx
     _smplx_model = _smplx.create(
@@ -138,60 +162,72 @@ def inject_wrist_from_hmp(pt_data: dict,
     left_hand_mean  = _smplx_model.left_hand_mean.detach().numpy()   # (45,)
     right_hand_mean = _smplx_model.right_hand_mean.detach().numpy()  # (45,)
 
+    # body_pose가 (F,63)이면 (F,21,3)으로 변환 (raw GVHMR hmr4d_results.pt 대응)
+    def _bp_to_213(t):
+        a = t.numpy().copy()
+        return a.reshape(a.shape[0], 21, 3) if a.ndim == 2 else a
+
     # INCAM 공간에서 R_local 계산
     params_incam = result["smpl_params_incam"]
-    bp_incam  = params_incam["body_pose"].numpy().copy()    # (1495, 21, 3)
-    go_incam  = params_incam["global_orient"].numpy().copy()  # (1495, 3)
-    lhp_incam = params_incam["left_hand_pose"].numpy().copy()   # (1495, 45)
-    rhp_incam = params_incam["right_hand_pose"].numpy().copy()  # (1495, 45)
+    bp_incam  = _bp_to_213(params_incam["body_pose"])         # (F, 21, 3)
+    go_incam  = params_incam["global_orient"].numpy().copy()  # (F, 3)
+    lhp_incam = params_incam["left_hand_pose"].numpy().copy()   # (F, 45)
+    rhp_incam = params_incam["right_hand_pose"].numpy().copy()  # (F, 45)
 
     params_global = result["smpl_params_global"]
-    bp_global  = params_global["body_pose"].numpy().copy()
+    bp_global  = _bp_to_213(params_global["body_pose"])
     lhp_global = params_global["left_hand_pose"].numpy().copy()
     rhp_global = params_global["right_hand_pose"].numpy().copy()
 
     for vid_f in range(SWING_START, SWING_END + 1):
         hmp_t = vid_f_to_hmp_t(vid_f)
 
-        # ── 우측 손 (body_pose[20]) ─────────────────────────────
-        R_hmp_right = aa_to_rotmat(poses_right[hmp_t, :3].astype(np.float64))
-        G_elbow_right = compute_fk_elbow(go_incam[vid_f], bp_incam[vid_f], RIGHT_CHAIN_BP)
-        R_local_right = G_elbow_right.T @ R_hmp_right
-        aa_right = rotmat_to_aa(R_local_right).astype(np.float32)
-        # 동일 local rotation → global/incam 모두 적용
-        bp_incam[vid_f, RIGHT_WRIST_BP] = aa_right
-        bp_global[vid_f, RIGHT_WRIST_BP] = aa_right
+        # ── wrist 주입 (inject_wrist=True일 때만; False면 base 유지) ──
+        if inject_wrist:
+            # 우측 손 (body_pose[20])
+            R_hmp_right = aa_to_rotmat(poses_right[hmp_t, :3].astype(np.float64))
+            G_elbow_right = compute_fk_elbow(go_incam[vid_f], bp_incam[vid_f], RIGHT_CHAIN_BP)
+            R_local_right = G_elbow_right.T @ R_hmp_right
+            aa_right = rotmat_to_aa(R_local_right).astype(np.float32)
+            bp_incam[vid_f, RIGHT_WRIST_BP] = aa_right
+            bp_global[vid_f, RIGHT_WRIST_BP] = aa_right
 
-        # ── 좌측 손 (body_pose[19]) ─────────────────────────────
-        # HMP 좌손: mirrored camera space → 원본 incam 공간으로 복원
-        R_hmp_left_mirror = aa_to_rotmat(poses_left[hmp_t, :3].astype(np.float64))
-        R_hmp_left = M @ R_hmp_left_mirror @ M   # 원본(incam) 카메라 공간
-        G_elbow_left = compute_fk_elbow(go_incam[vid_f], bp_incam[vid_f], LEFT_CHAIN_BP)
-        R_local_left = G_elbow_left.T @ R_hmp_left
-        aa_left = rotmat_to_aa(R_local_left).astype(np.float32)
-        bp_incam[vid_f, LEFT_WRIST_BP] = aa_left
-        bp_global[vid_f, LEFT_WRIST_BP] = aa_left
+            # 좌측 손 (body_pose[19]) — HMP 좌손: mirrored → 원본 incam 복원
+            R_hmp_left_mirror = aa_to_rotmat(poses_left[hmp_t, :3].astype(np.float64))
+            R_hmp_left = M @ R_hmp_left_mirror @ M
+            G_elbow_left = compute_fk_elbow(go_incam[vid_f], bp_incam[vid_f], LEFT_CHAIN_BP)
+            R_local_left = G_elbow_left.T @ R_hmp_left
+            aa_left = rotmat_to_aa(R_local_left).astype(np.float32)
+            bp_incam[vid_f, LEFT_WRIST_BP] = aa_left
+            bp_global[vid_f, LEFT_WRIST_BP] = aa_left
 
-        # ── hand_pose: HaMeR 원본 사용 (HMP prior가 테니스 그립을 망가뜨림) ─
+        # ── hand_pose: HaMeR + 시계열 후처리 (hand_postprocess) 또는 원본 ──
         if inject_hand_pose:
-            # 우측 hand_pose: HaMeR 원본 (vid_f 직접 인덱스, HMP 매핑 불필요)
-            d_right = det_all['right'].get(vid_f)
-            if d_right is not None:
-                # det_all['right'][f]['hand_pose'] = (45,) 이미 original convention
-                # SMPL-X stored = actual - hand_mean
-                rhp_val = d_right['hand_pose'].astype(np.float32) - right_hand_mean
+            # 우측
+            if hp_processed['right'] is not None:
+                rhp_src = hp_processed['right'][vid_f]            # 후처리된 값
+                has_r = det_all['right'].get(vid_f) is not None
+            else:
+                d_right = det_all['right'].get(vid_f)
+                rhp_src = d_right['hand_pose'].astype(np.float32) if d_right is not None else None
+                has_r = d_right is not None
+            if has_r:
+                rhp_val = rhp_src.astype(np.float32) - right_hand_mean
                 rhp_incam[vid_f] = rhp_val
                 rhp_global[vid_f] = rhp_val
-            # 우측 검출 없으면 kalman_B 값 그대로 유지
 
-            # 좌측 hand_pose: HaMeR 원본
-            # det_all['left'][f]['hand_pose'] = mirror 이미 적용된 left-hand convention
-            d_left = det_all['left'].get(vid_f)
-            if d_left is not None:
-                lhp_val = d_left['hand_pose'].astype(np.float32) - left_hand_mean
+            # 좌측 (det/hp_processed 모두 left-hand convention)
+            if hp_processed['left'] is not None:
+                lhp_src = hp_processed['left'][vid_f]
+                has_l = det_all['left'].get(vid_f) is not None
+            else:
+                d_left = det_all['left'].get(vid_f)
+                lhp_src = d_left['hand_pose'].astype(np.float32) if d_left is not None else None
+                has_l = d_left is not None
+            if has_l:
+                lhp_val = lhp_src.astype(np.float32) - left_hand_mean
                 lhp_incam[vid_f] = lhp_val
                 lhp_global[vid_f] = lhp_val
-            # 좌측 검출 없으면 kalman_B 값 그대로 유지
 
     params_incam["body_pose"] = torch.from_numpy(bp_incam)
     params_global["body_pose"] = torch.from_numpy(bp_global)
@@ -222,15 +258,27 @@ def main():
     print(f"left  handedness: {str(npz_left['handedness'])}")
     print(f"스윙 구간: f{SWING_START}~f{SWING_END} ({NUM_INPUT_FRAMES} frames)")
 
-    # 주입 전 우측 손목 각도 확인
-    bp_before = pt_data["smpl_params_incam"]["body_pose"][355]  # f355
-    aa_r_before = bp_before[RIGHT_WRIST_BP].numpy()
-    aa_l_before = bp_before[LEFT_WRIST_BP].numpy()
+    # 주입 전 우측 손목 각도 확인 (body_pose (F,63) 또는 (F,21,3) 대응)
+    _bpb = pt_data["smpl_params_incam"]["body_pose"][355].numpy().reshape(21, 3)
+    aa_r_before = _bpb[RIGHT_WRIST_BP]
+    aa_l_before = _bpb[LEFT_WRIST_BP]
     print(f"\n[Before] f355 right wrist aa: {aa_r_before}")
     print(f"[Before] f355 left  wrist aa: {aa_l_before}")
 
+    # 옵션 (환경변수):
+    #   CAP_INJECT_WRIST=0 → wrist 미주입 (버전 A: 손목 최적화 X, base wrist 유지)
+    #   CAP_HAND_POSTPROCESS=0 → 손가락 후처리 끔 (구 동작, 원본 HaMeR)
+    #   CAP_OUTPUT_PT → 출력 경로 오버라이드
+    inject_wrist = os.environ.get("CAP_INJECT_WRIST", "1") != "0"
+    hand_pp = os.environ.get("CAP_HAND_POSTPROCESS", "1") != "0"
+    out_pt = os.environ.get("CAP_OUTPUT_PT", OUTPUT_PT)
+    print(f"옵션: inject_wrist={inject_wrist}  hand_postprocess={hand_pp}")
+
     # 주입 실행
-    result = inject_wrist_from_hmp(pt_data, npz_right, npz_left, inject_hand_pose=True)
+    result = inject_wrist_from_hmp(pt_data, npz_right, npz_left,
+                                   inject_hand_pose=True,
+                                   inject_wrist=inject_wrist,
+                                   hand_postprocess=hand_pp)
 
     # 주입 후 확인
     bp_after = result["smpl_params_incam"]["body_pose"][355]
@@ -253,14 +301,16 @@ def main():
         "swing_end": SWING_END,
         "hmp_frames": HMP_FRAMES,
         "inject_hand_pose": True,
+        "inject_wrist": inject_wrist,
+        "hand_postprocess": hand_pp,
         "source_right": NPZ_RIGHT,
         "source_left": NPZ_LEFT,
     }
 
-    os.makedirs(os.path.dirname(OUTPUT_PT), exist_ok=True)
-    torch.save(result, OUTPUT_PT)
-    print(f"\n저장 완료: {OUTPUT_PT}")
-    print(f"파일 크기: {os.path.getsize(OUTPUT_PT) / 1e6:.1f} MB")
+    os.makedirs(os.path.dirname(out_pt), exist_ok=True)
+    torch.save(result, out_pt)
+    print(f"\n저장 완료: {out_pt}")
+    print(f"파일 크기: {os.path.getsize(out_pt) / 1e6:.1f} MB")
 
 
 if __name__ == "__main__":

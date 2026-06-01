@@ -389,7 +389,7 @@ def run_hamer_from_gvhmr_keypoints_debug(
         cap.clear_files(crops_dir, ('*.jpg', '*.json'))
     hamer_tic = time.perf_counter()
 
-    with cap.temporary_cwd(hamer_root):
+    with cap.safe_networkx_backend_import(), cap.temporary_cwd(hamer_root):
         from hamer.configs import CACHE_DIR_HAMER
         from hamer.datasets.vitdet_dataset import ViTDetDataset
         from hamer.models import DEFAULT_CHECKPOINT, download_models, load_hamer
@@ -586,6 +586,7 @@ def merge_hamer_hands_into_gvhmr_postprocessed(
 
 
 def main() -> None:
+    cap.reexec_with_project_python()
     total_tic = time.perf_counter()
     launch_cwd = Path.cwd()
     args = cap.complete_interactive_args(parse_args())

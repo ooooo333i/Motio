@@ -16,6 +16,36 @@ from typing import Any
 PROJ_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = PROJ_ROOT / "outputs" / "cap_pipeline"
 DEFAULT_HAMER_ROOT = PROJ_ROOT / "external" / "hamer"
+NETWORKX_BACKEND_ENV_KEYS = (
+    "NETWORKX_AUTOMATIC_BACKENDS",
+    "NETWORKX_BACKEND_PRIORITY",
+)
+DEFAULT_PROJECT_PYTHON = Path("/opt/conda/bin/python")
+
+
+def reexec_with_project_python(required_modules: tuple[str, ...] = ("cv2",)) -> None:
+    missing: list[str] = []
+    for module_name in required_modules:
+        try:
+            __import__(module_name)
+        except ModuleNotFoundError:
+            missing.append(module_name)
+
+    if not missing:
+        return
+
+    preferred = Path(os.environ.get("CAP_PYTHON", str(DEFAULT_PROJECT_PYTHON)))
+    current = Path(sys.executable).resolve()
+    if preferred.exists() and preferred.resolve() != current:
+        print(
+            f"[CAP] {current} is missing {', '.join(missing)}; restarting with {preferred}.",
+            flush=True,
+        )
+        os.execv(str(preferred), [str(preferred), *sys.argv])
+
+    raise ModuleNotFoundError(
+        f"Missing required module(s): {', '.join(missing)}. Run with {preferred} or set CAP_PYTHON."
+    )
 
 
 @dataclass
@@ -766,6 +796,66 @@ def ensure_hamer_on_path(hamer_root: Path) -> None:
     sys.path.insert(0, text)
 
 
+def _networkx_backend_env_keys() -> list[str]:
+    keys = [key for key in os.environ if key.startswith("NETWORKX_BACKEND_PRIORITY_")]
+    return [*NETWORKX_BACKEND_ENV_KEYS, *sorted(keys)]
+
+
+def _sanitize_networkx_backend_list(value: str) -> str:
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    return ",".join(name for name in names if name == "networkx" or name.isidentifier())
+
+
+@contextlib.contextmanager
+def safe_networkx_backend_import() -> Any:
+    """Hide invalid NetworkX backend names before pyrender imports networkx."""
+    import importlib.metadata as importlib_metadata
+
+    original_entry_points = importlib_metadata.entry_points
+    saved_env = {key: os.environ.get(key) for key in _networkx_backend_env_keys()}
+
+    for key, value in saved_env.items():
+        if value is None:
+            continue
+        sanitized = _sanitize_networkx_backend_list(value)
+        if sanitized:
+            os.environ[key] = sanitized
+        else:
+            os.environ.pop(key, None)
+
+    def entry_points_without_invalid_networkx_backends(*args: Any, **kwargs: Any) -> Any:
+        eps = original_entry_points(*args, **kwargs)
+        group = kwargs.get("group")
+        if group not in {"networkx.backends", "networkx.backend_info"}:
+            return eps
+
+        filtered = [ep for ep in eps if ep.name == "networkx" or ep.name.isidentifier()]
+        try:
+            return type(eps)(filtered)
+        except TypeError:
+            return filtered
+
+    importlib_metadata.entry_points = entry_points_without_invalid_networkx_backends
+    try:
+        import sys as _sys
+        if "networkx" not in _sys.modules:
+            import networkx.utils.backends as networkx_backends
+
+            networkx_backends.backends = {
+                name: ep
+                for name, ep in networkx_backends.backends.items()
+                if name == "networkx" or name.isidentifier()
+            }
+        yield
+    finally:
+        importlib_metadata.entry_points = original_entry_points
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def run_hamer_from_gvhmr_keypoints(
     frame_dir: Path,
     vitpose_path: Path,
@@ -792,7 +882,7 @@ def run_hamer_from_gvhmr_keypoints(
     clear_files(out_dir, ("*.npz", "*.jpg", "*.png", "*.obj"))
     hamer_tic = time.perf_counter()
 
-    with temporary_cwd(hamer_root):
+    with safe_networkx_backend_import(), temporary_cwd(hamer_root):
         from hamer.configs import CACHE_DIR_HAMER
         from hamer.datasets.vitdet_dataset import ViTDetDataset
         from hamer.models import DEFAULT_CHECKPOINT, download_models, load_hamer
@@ -1058,6 +1148,7 @@ def render_merged_result_video(gvhmr_run: GVHMRRun, merged_path: Path, force: bo
 
 
 def main() -> None:
+    reexec_with_project_python()
     total_tic = time.perf_counter()
     launch_cwd = Path.cwd()
     args = complete_interactive_args(parse_args())

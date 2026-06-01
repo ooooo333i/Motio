@@ -100,7 +100,7 @@ def save_video(images, video_path, fps=30, crf=17):
         images = np.array(images).astype(np.uint8)
 
     with iio.imopen(video_path, "w", plugin="pyav") as writer:
-        writer.init_video_stream("libx264", fps=normalize_video_fps(fps))
+        writer.init_video_stream("libx264", fps=float(normalize_video_fps(fps)))
         writer._video_stream.options = {"crf": str(crf)}
         writer.write(images)
 
@@ -108,7 +108,7 @@ def save_video(images, video_path, fps=30, crf=17):
 def get_writer(video_path, fps=30, crf=17):
     """remember to .close()"""
     writer = iio.imopen(video_path, "w", plugin="pyav")
-    writer.init_video_stream("libx264", fps=normalize_video_fps(fps))
+    writer.init_video_stream("libx264", fps=float(normalize_video_fps(fps)))
     writer._video_stream.options = {"crf": str(crf)}
     return writer
 

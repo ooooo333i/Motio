@@ -811,7 +811,17 @@ def safe_networkx_backend_import() -> Any:
     """Hide invalid NetworkX backend names before pyrender imports networkx."""
     import importlib.metadata as importlib_metadata
 
+    try:
+        import importlib_metadata as importlib_metadata_backport
+    except ModuleNotFoundError:
+        importlib_metadata_backport = None
+
     original_entry_points = importlib_metadata.entry_points
+    original_backport_entry_points = (
+        importlib_metadata_backport.entry_points
+        if importlib_metadata_backport is not None
+        else None
+    )
     saved_env = {key: os.environ.get(key) for key in _networkx_backend_env_keys()}
 
     for key, value in saved_env.items():
@@ -823,21 +833,43 @@ def safe_networkx_backend_import() -> Any:
         else:
             os.environ.pop(key, None)
 
-    def entry_points_without_invalid_networkx_backends(*args: Any, **kwargs: Any) -> Any:
-        eps = original_entry_points(*args, **kwargs)
-        group = kwargs.get("group")
-        if group not in {"networkx.backends", "networkx.backend_info"}:
+    def patch_metadata_entry_points(metadata_module: Any, original: Any) -> None:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            eps = original(*args, **kwargs)
+            group = kwargs.get("group")
+            if group in {"networkx.backends", "networkx.backend_info"}:
+                filtered = [
+                    ep
+                    for ep in eps
+                    if ep.name == "networkx" or ep.name.isidentifier()
+                ]
+                try:
+                    return type(eps)(filtered)
+                except TypeError:
+                    return filtered
             return eps
 
-        filtered = [ep for ep in eps if ep.name == "networkx" or ep.name.isidentifier()]
-        try:
-            return type(eps)(filtered)
-        except TypeError:
-            return filtered
+        metadata_module.entry_points = wrapper
 
-    importlib_metadata.entry_points = entry_points_without_invalid_networkx_backends
+    patch_metadata_entry_points(importlib_metadata, original_entry_points)
+    if importlib_metadata_backport is not None and original_backport_entry_points is not None:
+        patch_metadata_entry_points(
+            importlib_metadata_backport,
+            original_backport_entry_points,
+        )
+
+    saved_networkx_backend_entry_points = None
     try:
         import sys as _sys
+        if "networkx.utils.backends" in _sys.modules:
+            networkx_backends = _sys.modules["networkx.utils.backends"]
+            saved_networkx_backend_entry_points = getattr(
+                networkx_backends,
+                "entry_points",
+                None,
+            )
+            if saved_networkx_backend_entry_points is not None:
+                networkx_backends.entry_points = importlib_metadata.entry_points
         if "networkx" not in _sys.modules:
             import networkx.utils.backends as networkx_backends
 
@@ -849,6 +881,17 @@ def safe_networkx_backend_import() -> Any:
         yield
     finally:
         importlib_metadata.entry_points = original_entry_points
+        if (
+            importlib_metadata_backport is not None
+            and original_backport_entry_points is not None
+        ):
+            importlib_metadata_backport.entry_points = original_backport_entry_points
+        if saved_networkx_backend_entry_points is not None:
+            import sys as _sys
+            if "networkx.utils.backends" in _sys.modules:
+                _sys.modules[
+                    "networkx.utils.backends"
+                ].entry_points = saved_networkx_backend_entry_points
         for key, value in saved_env.items():
             if value is None:
                 os.environ.pop(key, None)

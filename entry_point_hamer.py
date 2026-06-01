@@ -388,7 +388,7 @@ def run_hamer_from_gvhmr_keypoints_debug(
     if save_crops:
         cap.clear_files(crops_dir, ('*.jpg', '*.json'))
     hamer_tic = time.perf_counter()
-
+   
     with cap.safe_networkx_backend_import(), cap.temporary_cwd(hamer_root):
         from hamer.configs import CACHE_DIR_HAMER
         from hamer.datasets.vitdet_dataset import ViTDetDataset

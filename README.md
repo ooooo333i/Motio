@@ -127,13 +127,13 @@ python entry_point_hamer.py --video <video.mp4> --output-root outputs/cap_pipeli
 ### 4. adaptive_v3 손목 (단일 영상, tennis=clip "input" 기준)
 ```bash
 python cap_arm_prefit.py                       # ViTPose 팔 fit  -> smplx_arm_prefit.pt
-python cap_compare_hmp_modes.py                # ★base 생성     -> cmp_baseline_hamer.pt
-python wrist_pipeline/01_fit_faithful.py       # 강한2D fit      -> cmp_dynhamr_faithful.pt
+python cap_compare_hmp_modes.py                # base 생성     -> cmp_baseline_hamer.pt
+python wrist_pipeline/01_fit_faithful.py       # 2D fit      -> cmp_dynhamr_faithful.pt
 python wrist_pipeline/02_adaptive_axial.py     # sudden->GVHMR axial -> cmp_adaptive_v2.pt
 python wrist_pipeline/03_badframe_slerp_smooth.py  # bad_frames slerp -> cmp_adaptive_v3.pt
 python wrist_pipeline/render_region.py cmp_adaptive_v3.pt render_adaptive_v3_FULL.mp4 0 9999
 ```
-- ⚠️ 위 스크립트는 `outputs/cap_pipeline/input/` 경로 하드코딩(tennis 전용). 다른 클립은 경로 수정 필요.
+- 위 단일영상 스크립트는 `outputs/cap_pipeline/input/`(tennis 클립) 기준 경로로 설정돼 있습니다. 다른 클립은 5절의 일반화 배치(`batch_*.py`, 경로 동적)를 사용하세요.
 - `cap_compare_hmp_modes.py`가 base(cmp_baseline_hamer.pt)를 만든다 — **없으면 adaptive_v3 재현 불가**.
 
 ### 5. 여러 영상 일반화 배치 (경로 동적, K 자동)

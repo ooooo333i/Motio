@@ -1,3 +1,4 @@
+import os
 from .mano_wrapper import MANO
 from .hamer import HAMER
 from .discriminator import Discriminator
@@ -48,5 +49,8 @@ def load_hamer(checkpoint_path=DEFAULT_CHECKPOINT):
         model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS')
         model_cfg.freeze()
 
-    model = HAMER.load_from_checkpoint(checkpoint_path, strict=False, cfg=model_cfg)
+    # init_renderer=False: skip pyrender/OpenGL (no GL platform on this host; detection
+    # does not need the renderer). Set CAP_HAMER_RENDERER=1 to restore.
+    _init_rend = os.environ.get("CAP_HAMER_RENDERER") == "1"
+    model = HAMER.load_from_checkpoint(checkpoint_path, strict=False, cfg=model_cfg, init_renderer=_init_rend)
     return model, model_cfg

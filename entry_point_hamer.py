@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import entry_point as cap
+import cap_wrist_refine
 
 
 @dataclass
@@ -46,8 +47,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hamer-root", type=str, default=str(cap.DEFAULT_HAMER_ROOT), help="Local HaMeR repository root.")
     parser.add_argument("--hamer-checkpoint", type=str, default=None, help="Optional HaMeR checkpoint path.")
     parser.add_argument("--hamer-batch-size", type=int, default=1, help="HaMeR inference batch size.")
-    parser.add_argument("--hamer-rescale-factor", type=float, default=2.5, help="HaMeR hand crop padding factor.")
+    parser.add_argument("--hamer-rescale-factor", type=float, default=2.0, help="HaMeR hand crop padding factor.")
     parser.add_argument("--hand-min-conf", type=float, default=0.35, help="Minimum GVHMR/VitPose wrist confidence.")
+    parser.add_argument(
+        "--bbox-smooth-sigma",
+        type=float,
+        default=2.5,
+        help="Gaussian sigma (frames) for temporal smoothing of hand bbox before HaMeR. "
+             "0 = disabled. Smoothing center x/y and size reduces crop jitter → more stable predictions.",
+    )
+    parser.add_argument(
+        "--hand-bbox-source",
+        choices=("coco17", "wholebody133", "auto", "yolo_hand"),
+        default="wholebody133",
+        help="Keypoint source for HaMeR hand bbox. "
+             "coco17 uses GVHMR wrist/elbow (fast, already cached). "
+             "wholebody133 runs ViTPose-H wholebody on person crops for tighter hand bboxes. "
+             "auto tries wholebody133 first, falls back to coco17 when hand keypoints are invalid. "
+             "yolo_hand runs a YOLO hand detector per frame.",
+    )
+    parser.add_argument(
+        "--yolo-hand-ckpt",
+        type=str,
+        default=None,
+        help="Path to YOLO hand detection checkpoint (.pt). "
+             "Defaults to inputs/checkpoints/yolo_hand/hand_yolov8s.pt.",
+    )
+    parser.add_argument(
+        "--yolo-hand-conf",
+        type=float,
+        default=0.3,
+        help="YOLO hand detection confidence threshold.",
+    )
+    parser.add_argument(
+        "--bbx-path",
+        type=str,
+        default=None,
+        help="Path to bbx.pt (person bboxes from GVHMR). "
+             "Required when --hand-bbox-source wholebody133. "
+             "Defaults to <output_dir>/preprocess/bbx.pt.",
+    )
     parser.add_argument("--save-hamer-crops", action="store_true", help="Save the actual normalized HaMeR input crops for debugging.")
     parser.add_argument("--skip-result-video", action="store_true", help="Skip the final merged mp4 render.")
     parser.add_argument("--no-interactive", action="store_true", help="Fail instead of prompting for missing values.")
@@ -359,6 +398,251 @@ def save_hamer_input_crops(batch: Any, model_cfg: Any, crops_dir: Path, frame_st
         )
 
 
+def _run_yolo_hand_on_frames(
+    frame_paths: "list[Path]",
+    yolo_ckpt: Path,
+    conf_thresh: float,
+) -> "list[tuple[list, list]]":
+    """Run YOLO hand detector on each frame. Returns list[(boxes, confs)] per frame."""
+    from ultralytics import YOLO
+    import numpy as np
+
+    model = YOLO(str(yolo_ckpt))
+    results_per_frame: list = []
+
+    for fp in tqdm(frame_paths, desc='YOLO-hand', leave=False):
+        res = model(str(fp), conf=conf_thresh, verbose=False)
+        frame_boxes: list = []
+        frame_confs: list = []
+        if res and len(res) > 0:
+            r = res[0]
+            if r.boxes is not None and len(r.boxes) > 0:
+                for box in r.boxes:
+                    xyxy = box.xyxy[0].cpu().numpy().tolist()
+                    conf = float(box.conf[0].cpu())
+                    frame_boxes.append(xyxy)
+                    frame_confs.append(conf)
+        results_per_frame.append((frame_boxes, frame_confs))
+
+    return results_per_frame
+
+
+def _extract_wholebody_kp2d(
+    frame_dir: Path,
+    kp2d_coco17: "np.ndarray",
+    bbx_path: Path | None,
+    hamer_root: Path,
+    min_conf: float,
+) -> "tuple[np.ndarray, float]":
+    """Run ViTPose-H wholebody on person crops and return (kp2d_133, elapsed_sec).
+
+    kp2d_133: float32 array [N_frames, 133, 3] (x, y, conf) in full-image pixels.
+    Only frames with a valid jpg in frame_dir are processed; others get zero rows.
+    """
+    import cv2
+    import numpy as np
+    import torch
+    import time
+
+    # Locate bbx.pt — person bbox (center_x, center_y, size) per frame
+    if bbx_path is None:
+        # Default: <frame_dir's parent>/preprocess/bbx.pt
+        bbx_path = frame_dir.parent / 'preprocess' / 'bbx.pt'
+    if not bbx_path.exists():
+        raise FileNotFoundError(
+            f"bbx.pt not found at {bbx_path}. "
+            "Pass --bbx-path or ensure GVHMR preprocess ran first."
+        )
+
+    bbx_data = torch.load(str(bbx_path), map_location='cpu')
+    bbx_xys = bbx_data['bbx_xys'].numpy()  # (N, 3): cx, cy, size
+
+    # Load wholebody ViTPose model
+    wb_ckpt = str(hamer_root / '_DATA' / 'vitpose_ckpts' / 'vitpose+_huge' / 'wholebody.pth')
+    if not Path(wb_ckpt).exists():
+        raise FileNotFoundError(f"Wholebody checkpoint not found: {wb_ckpt}")
+
+    import sys
+    from tqdm import tqdm as _tqdm
+    proj_root = str(Path(__file__).resolve().parent)
+    if proj_root not in sys.path:
+        sys.path.insert(0, proj_root)
+    from hmr4d.utils.preproc.vitpose_pytorch import build_model
+    from hmr4d.utils.kpts.kp2d_utils import keypoints_from_heatmaps
+
+    wb_model = build_model('ViTPose_huge_wholebody_256x192', wb_ckpt)
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    wb_model = wb_model.to(device).eval()
+
+    frame_paths = sorted(frame_dir.glob('*.jpg'))
+    n_frames = len(frame_paths)
+    n_kp = 133
+    kp2d_133 = np.zeros((n_frames, n_kp, 3), dtype=np.float32)
+
+    wb_tic = time.perf_counter()
+
+    # Process in batches of 16
+    batch_size = 16
+    MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    DST  = 256  # crop size
+
+    imgs_buf:  list = []
+    bbxs_buf:  list = []
+    idxs_buf:  list = []
+
+    def _flush(imgs_buf, bbxs_buf, idxs_buf):
+        imgs_t = torch.from_numpy(np.stack(imgs_buf)).to(device)  # (B, 3, 256, 256)
+        # VitPose expects 256x192: crop center 192 columns from 256-wide
+        imgs_t = imgs_t[:, :, :, 32:224]  # (B, 3, 256, 192)
+        with torch.no_grad():
+            hm = wb_model(imgs_t)  # (B, 133, 64, 48)
+        hm_np  = hm.cpu().numpy()
+        bbx_np = np.stack(bbxs_buf)  # (B, 3): cx, cy, size_effective
+        center = bbx_np[:, :2]
+        # scale: [width_scale, height_scale] / 200 for keypoints_from_heatmaps
+        size_w = bbx_np[:, 2] * (192 / 256)
+        size_h = bbx_np[:, 2]
+        scale  = np.stack([size_w, size_h], axis=1) / 200.0
+        preds, maxvals = keypoints_from_heatmaps(hm_np, center, scale, use_udp=True)
+        kp_out = np.concatenate([preds, maxvals], axis=-1)  # (B, 133, 3)
+        for local_i, global_i in enumerate(idxs_buf):
+            kp2d_133[global_i] = kp_out[local_i]
+
+    for fi, fp in enumerate(_tqdm(frame_paths, desc='WB-VitPose', leave=False)):
+        img = cv2.imread(str(fp))
+        if img is None or fi >= len(bbx_xys):
+            continue
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_h, img_w = img_rgb.shape[:2]
+
+        cx, cy, sz = float(bbx_xys[fi, 0]), float(bbx_xys[fi, 1]), float(bbx_xys[fi, 2])
+        # crop with 1.2× enlarge (same as GVHMR crop_and_resize)
+        hs = sz * 1.2 / 2
+        src = np.array([[cx - hs, cy - hs],
+                        [cx + hs - 1, cy - hs],
+                        [cx - hs, cy + hs - 1]], dtype=np.float32)
+        dst = np.array([[0, 0], [DST - 1, 0], [0, DST - 1]], dtype=np.float32)
+        A   = cv2.getAffineTransform(src, dst)
+        crop = cv2.warpAffine(img_rgb, A, (DST, DST), flags=cv2.INTER_LINEAR)
+
+        crop_f = (crop.astype(np.float32) / 255.0 - MEAN) / STD  # (256, 256, 3)
+        crop_t  = crop_f.transpose(2, 0, 1)                       # (3, 256, 256)
+
+        # effective size fed to vitpose (192-wide crop, full 256 height)
+        effective_sz = sz * 1.2
+        imgs_buf.append(crop_t)
+        bbxs_buf.append(np.array([cx, cy, effective_sz], dtype=np.float32))
+        idxs_buf.append(fi)
+
+        if len(imgs_buf) == batch_size:
+            _flush(imgs_buf, bbxs_buf, idxs_buf)
+            imgs_buf.clear(); bbxs_buf.clear(); idxs_buf.clear()
+
+    if imgs_buf:
+        _flush(imgs_buf, bbxs_buf, idxs_buf)
+
+    elapsed = time.perf_counter() - wb_tic
+    del wb_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return kp2d_133, elapsed
+
+
+def _smooth_bbox_trajectories(
+    boxes_per_side: "dict[str, dict[int, list[float]]]",
+    total_frames: int,
+    sigma: float,
+) -> "dict[str, dict[int, list[float]]]":
+    """Smooth bbox (cx, cy, size) trajectories per side with Gaussian filter.
+
+    boxes_per_side: {'left': {frame_idx: [x1,y1,x2,y2]}, 'right': {...}}
+    Returns same structure with smoothed boxes.
+    """
+    import numpy as np
+    from scipy.ndimage import gaussian_filter1d
+
+    result: dict = {}
+    for side, frame_boxes in boxes_per_side.items():
+        if not frame_boxes or sigma <= 0:
+            result[side] = frame_boxes
+            continue
+
+        # Build dense arrays (nan for missing frames)
+        cx  = np.full(total_frames, np.nan)
+        cy  = np.full(total_frames, np.nan)
+        sz  = np.full(total_frames, np.nan)
+        for fi, box in frame_boxes.items():
+            cx[fi] = (box[0] + box[2]) / 2.0
+            cy[fi] = (box[1] + box[3]) / 2.0
+            sz[fi] = max(box[2] - box[0], box[3] - box[1])
+
+        # Interpolate gaps before smoothing
+        for arr in (cx, cy, sz):
+            valid = np.where(~np.isnan(arr))[0]
+            if len(valid) < 2:
+                continue
+            arr[:] = np.interp(np.arange(total_frames), valid, arr[valid])
+
+        # Gaussian smooth
+        cx_s = gaussian_filter1d(cx, sigma=sigma)
+        cy_s = gaussian_filter1d(cy, sigma=sigma)
+        sz_s = gaussian_filter1d(sz, sigma=sigma)
+
+        # Rebuild xyxy boxes for originally-detected frames only
+        smoothed: dict = {}
+        for fi in frame_boxes:
+            if np.isnan(cx_s[fi]) or np.isnan(sz_s[fi]):
+                smoothed[fi] = frame_boxes[fi]
+                continue
+            half = sz_s[fi] / 2.0
+            # Keep original aspect (square bbox)
+            img_w = frame_boxes[fi][2] - frame_boxes[fi][0] + (frame_boxes[fi][0] + frame_boxes[fi][2]) / 2  # unused
+            smoothed[fi] = [
+                float(cx_s[fi] - half), float(cy_s[fi] - half),
+                float(cx_s[fi] + half), float(cy_s[fi] + half),
+            ]
+        result[side] = smoothed
+    return result
+
+
+def _draw_and_save_bbox_overlay(
+    img_cv2: "Any",
+    kp2d_coco17: "Any",
+    wholebody_frame: "Any | None",
+    boxes_used: "list[list[float]]",
+    width: int,
+    height: int,
+    min_conf: float,
+    out_path: Path,
+) -> None:
+    """Draw bbox overlay: red=coco17, green=wholebody133, blue=final-used."""
+    import cv2
+
+    overlay = img_cv2.copy()
+
+    # RED: coco17 reference boxes (always)
+    coco17_boxes, _ = cap.estimate_hand_boxes_from_coco17(kp2d_coco17, width, height, min_conf)
+    for b in coco17_boxes:
+        cv2.rectangle(overlay, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 0, 255), 2)
+
+    # GREEN: wholebody133 strict boxes (no coco17 fallback — shows what wholebody found)
+    if wholebody_frame is not None:
+        wb_boxes, _ = cap.estimate_hand_boxes_from_wholebody133(
+            wholebody_frame, width, height, min_conf, fallback_kp2d=None
+        )
+        for b in wb_boxes:
+            cv2.rectangle(overlay, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 0), 2)
+
+    # BLUE (thin): final boxes actually passed to HaMeR
+    for b in boxes_used:
+        cv2.rectangle(overlay, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (255, 0, 0), 1)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), overlay)
+
+
 def run_hamer_from_gvhmr_keypoints_debug(
     frame_dir: Path,
     vitpose_path: Path,
@@ -371,6 +655,11 @@ def run_hamer_from_gvhmr_keypoints_debug(
     force: bool,
     verbose: bool = False,
     save_crops: bool = False,
+    hand_bbox_source: str = "coco17",
+    bbx_path: Path | None = None,
+    yolo_hand_ckpt: Path | None = None,
+    yolo_hand_conf: float = 0.3,
+    bbox_smooth_sigma: float = 2.5,
 ) -> tuple[Path, dict[str, Any]]:
     import cv2
     import numpy as np
@@ -411,28 +700,116 @@ def run_hamer_from_gvhmr_keypoints_debug(
         else:
             kp2d = np.asarray(kp2d)
 
+        # Optionally build wholebody133 keypoints for tighter hand bboxes.
+        wholebody_kp2d = None
+        wholebody_tic = None
+        if hand_bbox_source in ('wholebody133', 'auto'):
+            wholebody_kp2d, wholebody_tic = _extract_wholebody_kp2d(
+                frame_dir, kp2d, bbx_path, hamer_root, min_conf
+            )
+            # Cache wholebody 2D for downstream wrist fitting (per-clip, generalizes).
+            if wholebody_kp2d is not None:
+                _pp_dir = bbx_path.parent if bbx_path is not None else (frame_dir.parent / 'preprocess')
+                _pp_dir.mkdir(parents=True, exist_ok=True)
+                _wb_out = _pp_dir / 'wholebody_kp2d.npy'
+                try:
+                    np.save(str(_wb_out), wholebody_kp2d)
+                    print(f"[CAP] Saved wholebody_kp2d -> {_wb_out}")
+                except Exception as _wb_exc:
+                    print(f"[CAP] Warning: failed to save wholebody_kp2d ({_wb_exc})")
+
+        # Optionally pre-run YOLO hand detector across all frames.
+        yolo_dets_per_frame = None
+        if hand_bbox_source == 'yolo_hand':
+            _default_yolo_ckpt = cap.PROJ_ROOT / 'inputs/checkpoints/yolo_hand/hand_yolov8s.pt'
+            _yolo_ckpt = yolo_hand_ckpt if yolo_hand_ckpt is not None else _default_yolo_ckpt
+            frame_paths_for_yolo = sorted(frame_dir.glob('*.jpg'))
+            yolo_dets_per_frame = _run_yolo_hand_on_frames(
+                frame_paths_for_yolo, _yolo_ckpt, yolo_hand_conf
+            )
+
         frame_paths = sorted(frame_dir.glob('*.jpg'))
         total = min(len(frame_paths), len(kp2d))
         saved = 0
+        bbox_overlay_dir = out_dir / 'bbox_overlays'
+
+        # ── Pass 1: collect raw bboxes per side ───────────────────────────────
+        sample_img = cv2.imread(str(frame_paths[0])) if frame_paths else None
+        img_h, img_w = (sample_img.shape[:2] if sample_img is not None else (1920, 1080))
+        raw_boxes: dict[str, dict[int, list]] = {'left': {}, 'right': {}}
+
+        for frame_idx, frame_path in enumerate(frame_paths[:total]):
+            if wholebody_kp2d is not None and frame_idx < len(wholebody_kp2d):
+                boxes, right = cap.estimate_hand_boxes_from_wholebody133(
+                    wholebody_kp2d[frame_idx], img_w, img_h, min_conf,
+                    fallback_kp2d=kp2d[frame_idx],
+                )
+            elif yolo_dets_per_frame is not None and frame_idx < len(yolo_dets_per_frame):
+                yolo_boxes, yolo_confs = yolo_dets_per_frame[frame_idx]
+                boxes, right = cap.estimate_hand_boxes_from_yolo(
+                    yolo_boxes, yolo_confs, kp2d[frame_idx], img_w, img_h,
+                    min_yolo_conf=yolo_hand_conf, min_wrist_conf=min_conf,
+                    fallback_kp2d=kp2d[frame_idx],
+                )
+            else:
+                boxes, right = cap.estimate_hand_boxes_from_coco17(kp2d[frame_idx], img_w, img_h, min_conf)
+            for box, r in zip(boxes, right):
+                side = 'right' if r == 1 else 'left'
+                raw_boxes[side][frame_idx] = box
+
+        # ── Smooth bbox trajectories before HaMeR ─────────────────────────────
+        if bbox_smooth_sigma > 0:
+            print(f'[CAP] Smoothing bbox trajectories (σ={bbox_smooth_sigma})...')
+            smooth_boxes = _smooth_bbox_trajectories(raw_boxes, total, bbox_smooth_sigma)
+        else:
+            smooth_boxes = raw_boxes
+
+        # ── Pass 2: run HaMeR with smoothed bboxes ────────────────────────────
         for frame_idx, frame_path in tqdm(list(enumerate(frame_paths[:total])), desc='HaMeR'):
             img_cv2 = cv2.imread(str(frame_path))
             if img_cv2 is None:
                 continue
 
             height, width = img_cv2.shape[:2]
-            boxes, right = cap.estimate_hand_boxes_from_coco17(kp2d[frame_idx], width, height, min_conf)
+
+            # Build boxes/right from smoothed dicts
+            boxes = []
+            right = []
+            if frame_idx in smooth_boxes.get('left', {}):
+                boxes.append(smooth_boxes['left'][frame_idx])
+                right.append(0)
+            if frame_idx in smooth_boxes.get('right', {}):
+                boxes.append(smooth_boxes['right'][frame_idx])
+                right.append(1)
+
+            # Clamp to image bounds
+            boxes = [
+                [max(0.0, b[0]), max(0.0, b[1]),
+                 min(float(width-1), b[2]), min(float(height-1), b[3])]
+                for b in boxes
+                if b[2] - b[0] >= 8 and b[3] - b[1] >= 8
+            ]
+            if not boxes:
+                right = []
+
+            if verbose:
+                _wb_frame = wholebody_kp2d[frame_idx] if wholebody_kp2d is not None and frame_idx < len(wholebody_kp2d) else None
+                _draw_and_save_bbox_overlay(
+                    img_cv2=img_cv2,
+                    kp2d_coco17=kp2d[frame_idx],
+                    wholebody_frame=_wb_frame,
+                    boxes_used=boxes,
+                    width=width,
+                    height=height,
+                    min_conf=min_conf,
+                    out_path=bbox_overlay_dir / f'{frame_path.stem}_bbox.jpg',
+                )
+
             if not boxes:
                 continue
 
             boxes_np = np.asarray(boxes, dtype=np.float32)
             right_np = np.asarray(right, dtype=np.float32)
-
-            if verbose:
-                debug_img = img_cv2.copy()
-                for box, right_flag in zip(boxes_np, right_np):
-                    color = (0, 255, 0) if int(right_flag) == 1 else (255, 0, 0)
-                    cv2.rectangle(debug_img, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
-                cv2.imwrite(str(out_dir / f'{frame_path.stem}_bbox.jpg'), debug_img)
 
             dataset = ViTDetDataset(model_cfg, img_cv2, boxes_np, right_np, rescale_factor=rescale_factor)
             dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -440,11 +817,37 @@ def run_hamer_from_gvhmr_keypoints_debug(
             for batch in dataloader:
                 if save_crops:
                     save_hamer_input_crops(batch, model_cfg, crops_dir, frame_path.stem)
-
+            
                 batch = recursive_to(batch, device)
+            
                 with torch.no_grad():
                     out = model(batch)
-
+            
+                if not globals().get("_HAMER_OUT_KEYS_PRINTED", False):
+                    print("[DEBUG] HaMeR out type:", type(out))
+            
+                    if hasattr(out, "keys"):
+                        print("[DEBUG] HaMeR out keys:", list(out.keys()))
+            
+                        for k, v in out.items():
+                            shape = getattr(v, "shape", None)
+                            dtype = getattr(v, "dtype", None)
+                            print(f"[DEBUG] key={k}, type={type(v)}, shape={shape}, dtype={dtype}")
+            
+                            if isinstance(v, dict):
+                                print(f"[DEBUG] nested keys for {k}: {list(v.keys())}")
+                                for kk, vv in v.items():
+                                    vv_shape = getattr(vv, "shape", None)
+                                    vv_dtype = getattr(vv, "dtype", None)
+                                    print(
+                                        f"    [DEBUG] {k}.{kk}: "
+                                        f"type={type(vv)}, shape={vv_shape}, dtype={vv_dtype}"
+                                    )
+                    else:
+                        print("[DEBUG] HaMeR out has no keys()")
+            
+                    globals()["_HAMER_OUT_KEYS_PRINTED"] = True
+            
                 pred_cam = out['pred_cam'].detach().clone()
                 pred_cam[:, 1] = (2 * batch['right'] - 1) * pred_cam[:, 1]
                 box_center = batch['box_center'].float()
@@ -459,6 +862,8 @@ def run_hamer_from_gvhmr_keypoints_debug(
                     np.savez(
                         out_dir / f'{frame_path.stem}_{person_id}.npz',
                         vertices=out['pred_vertices'][n].detach().cpu().numpy(),
+                        keypoints_3d=out['pred_keypoints_3d'][n].detach().cpu().numpy(),
+                        keypoints_2d=out['pred_keypoints_2d'][n].detach().cpu().numpy(),
                         cam_t=out['pred_cam_t'][n].detach().cpu().numpy(),
                         cam_t_full=pred_cam_t_full[n].detach().cpu().numpy(),
                         pred_cam=pred_cam[n].detach().cpu().numpy(),
@@ -481,7 +886,11 @@ def run_hamer_from_gvhmr_keypoints_debug(
         if save_crops:
             print(f'[CAP] Saved HaMeR input crops to {crops_dir}')
 
-    return out_dir, {'hamer_sec': time.perf_counter() - hamer_tic, 'hamer_saved_predictions': saved}
+    return out_dir, {
+        'hamer_sec': time.perf_counter() - hamer_tic,
+        'hamer_saved_predictions': saved,
+        'wholebody_sec': wholebody_tic if wholebody_tic is not None else 0.0,
+    }
 
 
 def smplx_hand_mean_offsets() -> dict[str, Any]:
@@ -636,8 +1045,9 @@ def main() -> None:
     frame_extract_sec = time.perf_counter() - frame_extract_tic
     print(f"[CAP] Prepared {frame_count} frames for HaMeR: {frame_dir}")
 
+    bbx_path_arg = cap.normalize_input_path(args.bbx_path, launch_cwd) if args.bbx_path else None
     hamer_tic = time.perf_counter()
-    run_hamer_from_gvhmr_keypoints_debug(
+    _, hamer_run_meta = run_hamer_from_gvhmr_keypoints_debug(
         frame_dir=frame_dir,
         vitpose_path=gvhmr_run.vitpose_path,
         out_dir=hamer_out_dir,
@@ -649,6 +1059,11 @@ def main() -> None:
         force=args.force,
         verbose=args.verbose,
         save_crops=args.save_hamer_crops,
+        hand_bbox_source=args.hand_bbox_source,
+        bbx_path=bbx_path_arg,
+        yolo_hand_ckpt=cap.normalize_input_path(args.yolo_hand_ckpt, launch_cwd) if args.yolo_hand_ckpt else None,
+        yolo_hand_conf=args.yolo_hand_conf,
+        bbox_smooth_sigma=args.bbox_smooth_sigma,
     )
     hamer_sec = time.perf_counter() - hamer_tic
 
@@ -658,6 +1073,8 @@ def main() -> None:
         **gvhmr_run.runtime_report,
         "frame_extract_sec": frame_extract_sec,
         "hamer_sec": hamer_sec,
+        "wholebody_sec": hamer_run_meta.get("wholebody_sec", 0.0),
+        "hamer_saved_predictions": hamer_run_meta.get("hamer_saved_predictions", 0),
         "input_frames": frame_count,
         "gvhmr_preprocess_fps": frame_count / gvhmr_run.runtime_report["gvhmr_preprocess_sec"]
         if gvhmr_run.runtime_report["gvhmr_preprocess_sec"] > 0
@@ -691,18 +1108,73 @@ def main() -> None:
 
     report["pipeline_total_sec"] = time.perf_counter() - total_tic
     report["pipeline_total_fps"] = frame_count / report["pipeline_total_sec"] if report["pipeline_total_sec"] > 0 else 0.0
-    merged_path, report = merge_hamer_hands_into_gvhmr_postprocessed(
-        gvhmr_run.hmr4d_results,
-        hamer_out_dir,
-        merged_path,
-        pp_cfg,
-        extra_meta=report,
+    # Update the JSON report with final timing — no need to re-run the merge for this.
+    merged_path.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    # Optional early exit: skip legacy Stage A/B wrist refine + 3-variant renders
+    # (used by the generalized batch pipeline which does its own wrist fitting).
+    if os.environ.get("CAP_SKIP_WRIST_REFINE") == "1":
+        print(f"[CAP] CAP_SKIP_WRIST_REFINE=1 -> stopping after merge: {merged_path}")
+        print(f"[CAP] Runtime total: {report['pipeline_total_sec']:.2f}s")
+        return
+
+    # === Wrist Refine (Stage A + Stage B) ===
+    # merged_path = smplx_merged_hamer_post.pt  (baseline — do NOT overwrite)
+    print("[CAP] === Starting Wrist Refine pipeline ===")
+    from hmr4d.utils.smplx_utils import make_smplx
+    smplx_model_wr = make_smplx("supermotion_fullhands").cuda()
+    debug_dir = gvhmr_run.output_dir / "wrist_refine_debug"
+
+    # Stage A only (wrist replacement, no 2D refine)
+    wrist_only_path = gvhmr_run.output_dir / "smplx_merged_hamer_wrist_only.pt"
+    cap_wrist_refine.run_wrist_refine(
+        merged_input_path=merged_path,
+        hamer_out_dir=hamer_out_dir,
+        output_path=wrist_only_path,
+        frame_dir=frame_dir,
+        smplx_model=smplx_model_wr,
+        do_refine=False,
+        debug_dir=debug_dir,
     )
+    print(f"[CAP] Wrist-only (Stage A): {wrist_only_path}")
+
+    # Stage A + Stage B Option-1 refine
+    wrist_refined_path = gvhmr_run.output_dir / "smplx_merged_hamer_wrist_refined.pt"
+    cap_wrist_refine.run_wrist_refine(
+        merged_input_path=merged_path,
+        hamer_out_dir=hamer_out_dir,
+        output_path=wrist_refined_path,
+        frame_dir=frame_dir,
+        smplx_model=smplx_model_wr,
+        do_refine=True,
+        target_mode="option1",
+        debug_dir=debug_dir,
+    )
+    print(f"[CAP] Wrist refined (Stage A+B): {wrist_refined_path}")
+
+    # Render all three variants to separate mp4 files
+    if not args.skip_result_video:
+        from tools.demo import demo as gvhmr_demo
+        for variant_pt, variant_mp4_name in [
+            (merged_path,        "smplx_merged_hamer_baseline_incam.mp4"),
+            (wrist_only_path,    "smplx_merged_hamer_wrist_only_incam.mp4"),
+            (wrist_refined_path, "smplx_merged_hamer_wrist_refined_incam.mp4"),
+        ]:
+            variant_mp4 = gvhmr_run.output_dir / variant_mp4_name
+            if not variant_mp4.exists() or args.force:
+                render_cfg = copy.deepcopy(gvhmr_run.cfg)
+                cap.set_cfg_path(render_cfg, "paths.hmr4d_results", str(variant_pt))
+                cap.set_cfg_path(render_cfg, "paths.incam_video", str(variant_mp4))
+                gvhmr_demo.render_incam(render_cfg)
+                print(f"[CAP] Rendered: {variant_mp4}")
 
     print("[CAP] Done")
     print(f"[CAP] Postprocessed merged SMPL-X params: {merged_path}")
+    print(f"[CAP] Wrist-only .pt:   {wrist_only_path}")
+    print(f"[CAP] Wrist-refined .pt: {wrist_refined_path}")
     if result_video is not None:
         print(f"[CAP] Merged result video: {result_video}")
+    print(f"[CAP] Wrist refine debug overlays: {debug_dir}")
     print(f"[CAP] Left hand frames: {report['left_hand_frames']} / {report['num_frames']}")
     print(f"[CAP] Right hand frames: {report['right_hand_frames']} / {report['num_frames']}")
     print(f"[CAP] Runtime total: {report['pipeline_total_sec']:.2f}s ({report['pipeline_total_fps']:.2f} frames/s)")

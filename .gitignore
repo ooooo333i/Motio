@@ -16,3 +16,9 @@ external/hamer/*.egg-info/
 external/hamer/hamer_demo_data.tar.gz
 external/hamer/_DATA/hamer_ckpts/checkpoints/
 external/hamer/_DATA/vitpose_ckpts/
+
+# local / generated
+.ipynb_checkpoints/
+*.egg-info/
+__pycache__/
+*.pyc

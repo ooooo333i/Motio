@@ -2,6 +2,26 @@
 
 이 폴더는 개발/학습용 파일을 제외하고, 서비스 추론에 필요한 코드와 체크포인트 배치 구조만 분리한 배포용 프로젝트입니다.
 
+## ⭐ Adaptive v4 — 손목/손 정제 (2026-06)
+
+GVHMR(몸) + HaMeR(손) + ViTPose(2D)를 **물리적으로 타당하게 융합**하는 후처리 파이프라인. 단안 영상에서 손목 위치/각도(전완 비틀림)·손가락 그립을 영상에 정합시킵니다. **서비스 기본 모드 = `quality`(=v4).** (레거시 fit2d 경로는 `CAP_OPT_MODE=fast`)
+
+```
+[1] 전처리   entry_point_hamer.py : GVHMR + ViTPose + HaMeR → smplx_merged_hamer_post.pt
+[2] v4 체인  entry_point_opt.py(_refine_quality):
+    A cap_arm_prefit  팔 IK + depth앵커 + ViTPose conf 게이팅
+    A2 batch_arm_smooth  가려짐 떨림 제거(conf 게이트)
+    B batch_hamer_wrist  손목=HaMeR 각도 + 신뢰도 게이트
+    C batch_rom_clamp    전완축 생체역학 손목 한계
+    D collision_detect + batch_axcol_v4  충돌을 2D-불변 축회전으로 해소
+    E batch_grip_prior   손가락 IoU/conf 게이트(body_pose 불변)
+    → hamer_wrist_hamer_rom_col_grip.pt (최종)
+```
+
+- 단일 클립 재현: `bash run_v4.sh outputs/cap_pipeline/<clip>`
+- **알고리즘·수식**: [docs/V4_ALGORITHM.md](docs/V4_ALGORITHM.md) · **서비스 흐름**: [docs/SERVICE_FLOW.md](docs/SERVICE_FLOW.md) · **발전기록**: [docs/V4_JOURNEY.md](docs/V4_JOURNEY.md)
+- **평가 근거**(독립 MediaPipe 2D 최고 · twist/충돌 최저 · vs Dyn-HaMR): [poster/EVALUATION.md](poster/EVALUATION.md) · [poster/V4_EVIDENCE.md](poster/V4_EVIDENCE.md), 그림 `poster/fig*.png`
+
 ## 포함한 것
 
 - `entry_point.py`: 단일 영상 추론 CLI

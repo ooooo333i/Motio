@@ -336,6 +336,21 @@ def run_arm_prefit(
 
     # ---- Outlier scores (per-side for wrist gating) ----
     err_L, err_R = load_outlier_scores_per_side(metrics_csv, F)
+    if float(err_L.abs().sum() + err_R.abs().sum()) == 0.0:
+        # csv 없음(일반화) → ViTPose 손목 conf+속도로 신뢰도 게이팅 직접 계산.
+        # 안 보이는 구간(저conf)·극단 점프(노이즈)에서 손목 2D 가중을 낮춰 GVHMR(평활)로 폴백. ~ms, 병목 아님.
+        from scipy.ndimage import gaussian_filter1d as _g1
+        def _conf_err(coco_idx):
+            cf = vitpose_np[:, coco_idx, 2].astype(np.float32)
+            xy = vitpose_np[:, coco_idx, :2].astype(np.float32)
+            e_conf = np.clip((0.6 - cf) / 0.4, 0, 1)                    # conf<0.6 → 점점 unreliable, <0.2 → 1
+            v = np.r_[0, np.linalg.norm(np.diff(xy, axis=0), axis=1)]
+            vm = max(float(np.median(v)), 1.0)
+            e_vel = np.clip((v - 6 * vm) / (6 * vm), 0, 1)             # 극단 점프(>6×중앙값=노이즈)만
+            return _g1(np.maximum(e_conf, e_vel), 2.0)                  # 게이트 부드럽게
+        err_L = torch.from_numpy(_conf_err(9))   # COCO17 L wrist
+        err_R = torch.from_numpy(_conf_err(10))  # COCO17 R wrist
+        print(f"[arm_prefit] conf기반 게이팅 폴백: L bad>0.5={int((err_L>0.5).sum())} R bad>0.5={int((err_R>0.5).sum())}")
     err_L = err_L.to(device)   # (F,)
     err_R = err_R.to(device)   # (F,)
 
@@ -428,6 +443,17 @@ def run_arm_prefit(
             return float("nan")
         return float(np.sqrt(numer / denom))
 
+    # Depth anchor: GVHMR arm-joint cam-z (매끄러운 깊이 기준). env CAP_ARM_DEPTH (기본 0=off).
+    import os as _os
+    W_DEPTH = float(_os.environ.get("CAP_ARM_DEPTH", "0"))
+    with torch.no_grad():
+        _gv = smplx_model.forward(betas=betas, global_orient=global_orient,
+            body_pose=body_pose_orig.detach().reshape(F, -1),
+            left_hand_pose=lhand, right_hand_pose=rhand, transl=transl, **extra_keys)
+        z_gv = _gv.joints[:, smplx_jids, 2].detach()   # (F,6) GVHMR 팔관절 cam-z
+    if W_DEPTH > 0:
+        print(f"[arm_prefit] depth anchor ON: w_depth={W_DEPTH}")
+
     for it in range(iters):
         opt.zero_grad()
 
@@ -469,7 +495,9 @@ def run_arm_prefit(
         R_arm = aa_to_rotmat(body_free[:, arm_opt_ids, :])  # (F, 8, 3, 3)
         L_tc  = geodesic_distance_batch(R_arm[:-1], R_arm[1:])
 
-        loss = L_2d + L_prior + w_tc * L_tc
+        # L_depth: 팔관절 cam-z를 GVHMR에 soft 앵커 (깊이 깜빡임 방지, 2D는 유지)
+        L_depth = ((joints3d[:, smplx_jids, 2] - z_gv) ** 2).mean()
+        loss = L_2d + L_prior + w_tc * L_tc + W_DEPTH * L_depth
 
         # Track arm RMS
         with torch.no_grad():

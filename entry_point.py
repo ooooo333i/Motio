@@ -13,6 +13,20 @@ from pathlib import Path
 from typing import Any
 
 
+def amp_ctx():
+    """fp16 autocast 컨텍스트. **기본 OFF**(CAP_AMP=1 로만 활성).
+
+    검증 결과: HaMeR/wholebody 에 fp16 을 켜면 손 포즈가 max 2.9°/p99 0.6° 변하고
+    속도 이득은 ~8s(전체 71→63.5s)뿐. 이 프로젝트의 핵심 민감부가 손/손목이라 기본 비활성.
+    GVHMR 전처리(가장 큰 25s)는 ViTPose heatmap → cv2.GaussianBlur(CV_16F 미지원) 때문에
+    autocast 적용 불가. 켜려면 CAP_AMP=1. (HaMeR 속도는 #2 크롭 병렬화로 품질 무손실 단축.)
+    """
+    import torch
+    if os.environ.get("CAP_AMP", "0") == "1" and torch.cuda.is_available():
+        return torch.autocast("cuda", dtype=torch.float16)
+    return contextlib.nullcontext()
+
+
 PROJ_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = PROJ_ROOT / "outputs" / "cap_pipeline"
 DEFAULT_HAMER_ROOT = PROJ_ROOT / "external" / "hamer"
@@ -518,6 +532,31 @@ def prepare_selected_person_track(
             print("[CAP] Existing person bbox cache found. Use --force to change the selected person.")
         return
 
+    # ── YOLO 재추적 스킵: 검출 단계에서 이미 뽑은 선택 선수의 raw 트랙 재사용 ──
+    # 검출과 동일 영상·동일 build_one_track 결과라 재추적과 bit-exact. YOLO 1패스(~15s) 절약.
+    # CAP_REUSE_BBX_NPZ(검출 *_tracks.npz) + person_track_id 가 있을 때만. 실패/부재 시 아래 재추적으로 폴백.
+    _reuse = os.environ.get("CAP_REUSE_BBX_NPZ", "")
+    if _reuse and person_track_id is not None and Path(_reuse).exists():
+        try:
+            import numpy as _np
+            _d = _np.load(_reuse)
+            _key = f"t{int(person_track_id)}"
+            if _key in _d:
+                bbx_xyxy = torch.from_numpy(_d[_key].astype("float32")).float()
+                bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()
+                bbx_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys,
+                     "selected_track_id": int(person_track_id), "reused_from_detection": True},
+                    bbx_path,
+                )
+                print(f"[CAP] Reusing detection track for person {person_track_id} "
+                      f"→ skip YOLO re-track ({bbx_xyxy.shape[0]} frames)")
+                return
+            print(f"[CAP] reuse: track t{person_track_id} not in {_reuse}; re-tracking.")
+        except Exception as _e:
+            print(f"[CAP] reuse bbx failed ({type(_e).__name__}: {_e}); re-tracking.")
+
     tracker = Tracker()
     track_history = tracker.track(cfg.video_path)
     id_to_frame_ids, id_to_bbx_xyxys, id_sorted = tracker.sort_track_length(track_history, cfg.video_path)
@@ -615,6 +654,9 @@ def run_gvhmr(
 
     gvhmr_demo.Log.info("[CAP] Running GVHMR preprocess")
     preprocess_tic = time.perf_counter()
+    # NOTE: run_preprocess 전체를 autocast 로 감싸면 ViTPose heatmap 이 fp16 이 되어
+    # 다운스트림 cv2.GaussianBlur(CV_16F 미지원)에서 깨진다. fp16 은 GVHMR 내부의
+    # 안전한 GPU 추출부(vit_features)에만 타깃 적용한다(hmr4d 측). 여기선 감싸지 않음.
     try:
         gvhmr_demo.run_preprocess(cfg)
     except Exception as exc:

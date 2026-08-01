@@ -146,4 +146,4 @@ python batch_render.py "$CLIP" fit2d.pt render_fit2d.mp4 <video.mp4>
 
 ### 참고
 - 전체 근거/실패기록: `docs/WRIST_PIPELINE.md`, `docs/PIPELINE_MAP.md`
-- Dyn-HaMR 비교(별도 격리 환경): `/workspace/Dyn-HaMR` 보존
+- Dyn-HaMR 비교(별도 격리 환경): `/workspace/Dyn-HaMR` 보존.

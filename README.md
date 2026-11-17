@@ -37,7 +37,9 @@ E. 그립 보정     손가락만, 가려짐·두 손 겹침 시 IoU/신뢰도 �
 
 ## 결과
 
-![wrist comparison](docs/assets/motio_wrist_zoom.gif)
+![hand close-up](docs/assets/motio_hand_closeup.gif)
+
+<sub>손 부분 확대 (0.33배속). Naive graft는 손목이 뒤로 꺾이거나 비틀리는 반면, Ours는 라켓을 쥔 손목이 팔과 자연스럽게 이어집니다.</sub>
 
 같은 HaMeR 손을 쓰고 **합치는 방식만 바꿔** 비교했습니다 (3D GT가 없는 in-the-wild 영상이라 GT-free 지표 사용).
 

@@ -4,7 +4,7 @@
 
 > Monocular video → physically-plausible full-body + hand 3D motion. Fuses GVHMR (body) and HaMeR (hands) with a training-free, twist-aware wrist refinement.
 
-세종대학교 소프트웨어학과 종합설계(캡스톤) 2026 · 4인 팀 · **팀장**
+세종대학교 소프트웨어학과 종합설계(캡스톤) 2026 · 4인 팀
 
 ![Motio demo](docs/assets/motio_demo.gif)
 
@@ -54,12 +54,6 @@ E. 그립 보정     손가락만, 가려짐·두 손 겹침 시 IoU/신뢰도 �
 - 정제 단계 속도: 약 0.04–0.07 s/frame.
 
 자세한 수식·평가: [`poster/METHOD.md`](poster/METHOD.md) · [`poster/V4_EVIDENCE.md`](poster/V4_EVIDENCE.md) · [`docs/V4_JOURNEY.md`](docs/V4_JOURNEY.md)
-
-## 내 역할 (팀장)
-
-- **통합**: 팀원별 모듈(GVHMR 몸 / HaMeR 손)을 하나의 파이프라인으로 병합하고, 프론트엔드–추론 서버를 잇는 백엔드(`motio_backend/`) 구성
-- **서버 배포**: FastAPI 비동기 작업 서버, Docker 이미지, RunPod GPU 환경 구축
-- **손/손목 후처리**: 위 v4 정제 파이프라인 설계·구현·평가 (`run_v4.sh`, `batch_*.py`, `eval/cap_metrics.py`)
 
 ## 기술 스택
 

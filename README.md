@@ -1,6 +1,73 @@
-# CAP Deploy
+# Motio
 
-이 폴더는 개발/학습용 파일을 제외하고, 서비스 추론에 필요한 코드와 체크포인트 배치 구조만 분리한 배포용 프로젝트입니다.
+**영상 한 편에서 손가락까지 포함한 3D 전신 모션을 추출해, 바로 쓸 수 있는 애니메이션 에셋(SMPL-X / FBX)으로 만들어주는 서비스**
+
+> Monocular video → physically-plausible full-body + hand 3D motion. Fuses GVHMR (body) and HaMeR (hands) with a training-free, twist-aware wrist refinement.
+
+세종대학교 소프트웨어학과 종합설계(캡스톤) 2026 · 4인 팀 · **팀장**
+
+![Motio demo](docs/assets/motio_demo.gif)
+
+---
+
+## 문제
+
+손까지 포함한 3D 모션을 얻으려면 **전신 모델(GVHMR)** 과 **손 모델(HaMeR)** 의 결과를 하나의 SMPL-X로 합쳐야 합니다. 그런데 HaMeR는 손 크롭만 보고 손목 방향을 추정하기 때문에, 그 손이 **어느 팔에 붙어 있는지 모릅니다.** 손목 회전을 그대로 옮겨 붙이는 일반적인 방식(naive graft)은 그래서 **부자연스러운 전완 비틀림**과 **손–몸 관통**을 만듭니다.
+
+## 핵심 아이디어 — Temporal-core Guided Non-Temporal Fitting
+
+시간축을 보는 **GVHMR(temporal)** 을 뼈대로 삼고, 프레임 단위인 **HaMeR(non-temporal)** 의 손을 그 위에 맞춰 넣습니다. 이때 기준은 **관측 가능한 축과 아닌 축의 분리**입니다.
+
+단안 2D 영상은 **전완 축을 따라 도는 회전(twist)** 을 거의 관측하지 못합니다. 그래서 손목 회전을 둘로 나눠, 각각 믿을 수 있는 쪽에서 가져옵니다.
+
+| 성분 | 2D에서 관측 | 가져오는 곳 |
+|---|:--:|---|
+| **swing** (굴곡·편위) | 가능 | HaMeR (손 방향) |
+| **twist** (전완 비틀림) | 불가능 | 몸(팔 IK)의 물리적 전완 값 |
+
+이 원리를 확장해 후처리를 **서로 간섭하지 않는 단계**로 구성했습니다 (추가 학습 없음).
+
+```
+A. 팔 IK        ViTPose 2D로 위치, GVHMR로 깊이 앵커
+B. 손목 병합     swing = HaMeR, twist = 전완  (+ 신뢰도 게이트, 불량 프레임 SLERP 보간)
+C. ROM clamp    손목 생체역학 범위 제한
+D. 충돌 해소     2D에 안 보이는 twist 축으로만 손을 돌려 관통 제거 (2D 정합 손실 0)
+E. 그립 보정     손가락만, 가려짐·두 손 겹침 시 IoU/신뢰도 게이트
+```
+
+## 결과
+
+![wrist comparison](docs/assets/motio_wrist_zoom.gif)
+
+같은 HaMeR 손을 쓰고 **합치는 방식만 바꿔** 비교했습니다 (3D GT가 없는 in-the-wild 영상이라 GT-free 지표 사용).
+
+| 지표 | Naive graft | **Ours** |
+|---|:--:|:--:|
+| 전완 비틀림 위반율 ↓ (8개 영상 평균) | 7.07% | **5.16%** |
+| 손–몸/손–손 관통 프레임 ↓ (front_3) | 243 | **109 (−55%)** |
+| 손 2D 정확도 (독립 검출기 MediaPipe PCK) | 0.620 | **0.623** (동등) |
+
+- **2D 정확도는 그대로 두고** 비틀림과 관통만 줄였습니다.
+- 2D 평가는 일부러 **어떤 방법도 학습·피팅에 쓰지 않은 MediaPipe**로 채점했습니다. 피팅 대상(WholeBody 키포인트)으로 채점하면 2D에 직접 맞춘 방법이 유리하게 나오는 순환 문제를 확인했기 때문입니다 (0.90 → 독립 기준 0.46).
+- 정제 단계 속도: 약 0.04–0.07 s/frame.
+
+자세한 수식·평가: [`poster/METHOD.md`](poster/METHOD.md) · [`poster/V4_EVIDENCE.md`](poster/V4_EVIDENCE.md) · [`docs/V4_JOURNEY.md`](docs/V4_JOURNEY.md)
+
+## 내 역할 (팀장)
+
+- **통합**: 팀원별 모듈(GVHMR 몸 / HaMeR 손)을 하나의 파이프라인으로 병합하고, 프론트엔드–추론 서버를 잇는 백엔드(`motio_backend/`) 구성
+- **서버 배포**: FastAPI 비동기 작업 서버, Docker 이미지, RunPod GPU 환경 구축
+- **손/손목 후처리**: 위 v4 정제 파이프라인 설계·구현·평가 (`batch_*.py`, `cap_metrics.py`, `run_v4.sh`)
+
+## 기술 스택
+
+PyTorch · PyTorch3D · SMPL-X / MANO · GVHMR · HaMeR · ViTPose · MediaPipe · FastAPI · Docker · RunPod · Blender(FBX)
+
+---
+
+## 배포 구성
+
+이 저장소는 개발/학습용 파일을 제외하고, 서비스 추론에 필요한 코드와 체크포인트 배치 구조만 분리한 배포용 프로젝트입니다.
 
 ## ⭐ Adaptive v4 — 손목/손 정제 (2026-06)
 

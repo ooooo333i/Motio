@@ -59,11 +59,29 @@ E. 그립 보정     손가락만, 가려짐·두 손 겹침 시 IoU/신뢰도 �
 
 - **통합**: 팀원별 모듈(GVHMR 몸 / HaMeR 손)을 하나의 파이프라인으로 병합하고, 프론트엔드–추론 서버를 잇는 백엔드(`motio_backend/`) 구성
 - **서버 배포**: FastAPI 비동기 작업 서버, Docker 이미지, RunPod GPU 환경 구축
-- **손/손목 후처리**: 위 v4 정제 파이프라인 설계·구현·평가 (`batch_*.py`, `cap_metrics.py`, `run_v4.sh`)
+- **손/손목 후처리**: 위 v4 정제 파이프라인 설계·구현·평가 (`run_v4.sh`, `batch_*.py`, `eval/cap_metrics.py`)
 
 ## 기술 스택
 
 PyTorch · PyTorch3D · SMPL-X / MANO · GVHMR · HaMeR · ViTPose · MediaPipe · FastAPI · Docker · RunPod · Blender(FBX)
+
+## 프로젝트 구조
+
+```
+├── service.py, entry_point*.py   # 추론 서비스 / CLI 진입점
+├── run_v4.sh                     # v4 정제 체인 실행 (A→E)
+├── cap_arm_prefit.py, batch_*.py # v4 체인 각 단계 (팔 IK, 손목 병합, ROM, 충돌, 그립)
+├── physical_limits.py            # 손목 ROM·swing-twist 분해
+├── motio_backend/                # 프론트–추론 서버 연결 FastAPI 백엔드
+├── postprocess_pipeline/         # 후처리 → Unreal FBX 변환
+├── eval/                         # 평가 지표 (MediaPipe 독립 2D, twist, 충돌) · 비교 baseline
+├── render/                       # 비교 영상 렌더링
+├── experiments/v4_variants/      # v4 확정 전 실험 변형들
+├── wrist_pipeline/               # 이전 버전(v3) 손목 파이프라인
+├── deprecated/                   # 폐기한 시도
+├── poster/, docs/                # 방법·평가 문서, 포스터 그림
+└── hmr4d/, external/hamer/       # GVHMR / HaMeR 런타임
+```
 
 ---
 
@@ -216,21 +234,21 @@ python entry_point_hamer.py --video <video.mp4> --output-root outputs/cap_pipeli
 ### 4. adaptive_v3 손목 (단일 영상, tennis=clip "input" 기준)
 ```bash
 python cap_arm_prefit.py                       # ViTPose 팔 fit  -> smplx_arm_prefit.pt
-python cap_compare_hmp_modes.py                # base 생성     -> cmp_baseline_hamer.pt
+python wrist_pipeline/cap_compare_hmp_modes.py             # base 생성     -> cmp_baseline_hamer.pt
 python wrist_pipeline/01_fit_faithful.py       # 2D fit      -> cmp_dynhamr_faithful.pt
 python wrist_pipeline/02_adaptive_axial.py     # sudden->GVHMR axial -> cmp_adaptive_v2.pt
 python wrist_pipeline/03_badframe_slerp_smooth.py  # bad_frames slerp -> cmp_adaptive_v3.pt
 python wrist_pipeline/render_region.py cmp_adaptive_v3.pt render_adaptive_v3_FULL.mp4 0 9999
 ```
 - 위 단일영상 스크립트는 `outputs/cap_pipeline/input/`(tennis 클립) 기준 경로로 설정돼 있습니다. 다른 클립은 5절의 일반화 배치(`batch_*.py`, 경로 동적)를 사용하세요.
-- `cap_compare_hmp_modes.py`가 base(cmp_baseline_hamer.pt)를 만든다 — **없으면 adaptive_v3 재현 불가**.
+- `wrist_pipeline/cap_compare_hmp_modes.py`가 base(cmp_baseline_hamer.pt)를 만든다 — **없으면 adaptive_v3 재현 불가**.
 
 ### 5. 여러 영상 일반화 배치 (경로 동적, K 자동)
 ```bash
 CLIP=outputs/cap_pipeline/<stem>
 python batch_fit2d.py "$CLIP"            # 강한2D + 회전평활 + 손가락 고정 -> fit2d.pt
 python batch_finger_kalman.py "$CLIP"    # 손가락만 Kalman(손목 axial 제외) -> fit2d_fingerkalman.pt
-python batch_render.py "$CLIP" fit2d.pt render_fit2d.mp4 <video.mp4>
+python render/batch_render.py "$CLIP" fit2d.pt render_fit2d.mp4 <video.mp4>
 ```
 
 ### 참고

@@ -495,8 +495,8 @@ def _extract_wholebody_kp2d(
         imgs_t = torch.from_numpy(np.stack(imgs_buf)).to(device)  # (B, 3, 256, 256)
         # VitPose expects 256x192: crop center 192 columns from 256-wide
         imgs_t = imgs_t[:, :, :, 32:224]  # (B, 3, 256, 192)
-        with torch.no_grad():
-            hm = wb_model(imgs_t)  # (B, 133, 64, 48)
+        with torch.no_grad(), cap.amp_ctx():
+            hm = wb_model(imgs_t).float()  # fp16 conv → 출력은 fp32(다운스트림 cv2 보호)
         hm_np  = hm.cpu().numpy()
         bbx_np = np.stack(bbxs_buf)  # (B, 3): cx, cy, size_effective
         center = bbx_np[:, :2]
@@ -765,116 +765,127 @@ def run_hamer_from_gvhmr_keypoints_debug(
             smooth_boxes = raw_boxes
 
         # ── Pass 2: run HaMeR with smoothed bboxes ────────────────────────────
-        for frame_idx, frame_path in tqdm(list(enumerate(frame_paths[:total])), desc='HaMeR'):
-            img_cv2 = cv2.imread(str(frame_path))
-            if img_cv2 is None:
-                continue
+        # ── Pass 2: run HaMeR ─────────────────────────────────────────────────
+        # ViT-Huge forward 가 비용의 대부분. 프레임당 1~2 크롭을 batch=1 로 순차 추론하면
+        # GPU 가 거의 논다(실측 ~5.9fps). 그래서 *모든 프레임의 손 크롭을 모아 큰 배치*로
+        # 일괄 추론한다(CAP_HAMER_BATCH, 기본 64). ViT 는 LayerNorm 기반이라 배치 구성과
+        # 무관하게 크롭별 출력이 동일 → per-frame 방식과 결과 동치. 같은 영상은 해상도가
+        # 일정해 img_size.max() 도 동일(scaled_focal_length 보존).
+        # CAP_HAMER_LEGACY=1 이면 기존 per-frame 경로(검증/폴백용).
+        legacy = os.environ.get('CAP_HAMER_LEGACY') == '1'
+        cross_batch = max(1, int(os.environ.get('CAP_HAMER_BATCH', '64')))
 
+        def _save_batch(out, batch, stems):
+            nonlocal saved
+            # autocast(fp16) 시 out 텐서가 fp16 일 수 있다. 저장 포맷/다운스트림 merge 와의
+            # 일관성을 위해 fp32 로 캐스팅해 저장(값은 fp16 정밀도, dtype 은 기존과 동일 float32).
+            pred_cam = out['pred_cam'].detach().float().clone()
+            pred_cam[:, 1] = (2 * batch['right'] - 1) * pred_cam[:, 1]
+            box_center = batch['box_center'].float()
+            box_size = batch['box_size'].float()
+            img_size = batch['img_size'].float()
+            scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
+            pred_cam_t_full = cam_crop_to_full(pred_cam, box_center, box_size, img_size, scaled_focal_length)
+            for n in range(batch['img'].shape[0]):
+                person_id = int(batch['personid'][n])
+                right_flag = int(float(batch['right'][n].detach().cpu().numpy()))
+                np.savez(
+                    out_dir / f'{stems[n]}_{person_id}.npz',
+                    vertices=out['pred_vertices'][n].detach().float().cpu().numpy(),
+                    keypoints_3d=out['pred_keypoints_3d'][n].detach().float().cpu().numpy(),
+                    keypoints_2d=out['pred_keypoints_2d'][n].detach().float().cpu().numpy(),
+                    cam_t=out['pred_cam_t'][n].detach().float().cpu().numpy(),
+                    cam_t_full=pred_cam_t_full[n].detach().cpu().numpy(),
+                    pred_cam=pred_cam[n].detach().cpu().numpy(),
+                    box_center=box_center[n].detach().cpu().numpy(),
+                    box_size=box_size[n].detach().cpu().numpy(),
+                    img_size=img_size[n].detach().cpu().numpy(),
+                    focal_length=np.asarray(scaled_focal_length.detach().cpu().item(), dtype=np.float32),
+                    mano_params={k: v[n].detach().float().cpu().numpy() for k, v in out['pred_mano_params'].items()},
+                    is_right=right_flag,
+                )
+                saved += 1
+
+        def _boxes_for_frame(frame_idx, img_cv2):
             height, width = img_cv2.shape[:2]
-
-            # Build boxes/right from smoothed dicts
-            boxes = []
-            right = []
+            boxes, right = [], []
             if frame_idx in smooth_boxes.get('left', {}):
-                boxes.append(smooth_boxes['left'][frame_idx])
-                right.append(0)
+                boxes.append(smooth_boxes['left'][frame_idx]); right.append(0)
             if frame_idx in smooth_boxes.get('right', {}):
-                boxes.append(smooth_boxes['right'][frame_idx])
-                right.append(1)
-
-            # Clamp to image bounds
+                boxes.append(smooth_boxes['right'][frame_idx]); right.append(1)
             boxes = [
                 [max(0.0, b[0]), max(0.0, b[1]),
-                 min(float(width-1), b[2]), min(float(height-1), b[3])]
+                 min(float(width - 1), b[2]), min(float(height - 1), b[3])]
                 for b in boxes
                 if b[2] - b[0] >= 8 and b[3] - b[1] >= 8
             ]
             if not boxes:
                 right = []
-
             if verbose:
                 _wb_frame = wholebody_kp2d[frame_idx] if wholebody_kp2d is not None and frame_idx < len(wholebody_kp2d) else None
                 _draw_and_save_bbox_overlay(
-                    img_cv2=img_cv2,
-                    kp2d_coco17=kp2d[frame_idx],
-                    wholebody_frame=_wb_frame,
-                    boxes_used=boxes,
-                    width=width,
-                    height=height,
-                    min_conf=min_conf,
-                    out_path=bbox_overlay_dir / f'{frame_path.stem}_bbox.jpg',
+                    img_cv2=img_cv2, kp2d_coco17=kp2d[frame_idx], wholebody_frame=_wb_frame,
+                    boxes_used=boxes, width=width, height=height, min_conf=min_conf,
+                    out_path=bbox_overlay_dir / f'{frame_paths[frame_idx].stem}_bbox.jpg',
                 )
+            return boxes, right
 
-            if not boxes:
-                continue
+        if legacy:
+            for frame_idx, frame_path in tqdm(list(enumerate(frame_paths[:total])), desc='HaMeR'):
+                img_cv2 = cv2.imread(str(frame_path))
+                if img_cv2 is None:
+                    continue
+                boxes, right = _boxes_for_frame(frame_idx, img_cv2)
+                if not boxes:
+                    continue
+                boxes_np = np.asarray(boxes, dtype=np.float32)
+                right_np = np.asarray(right, dtype=np.float32)
+                dataset = ViTDetDataset(model_cfg, img_cv2, boxes_np, right_np, rescale_factor=rescale_factor)
+                dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+                for batch in dataloader:
+                    if save_crops:
+                        save_hamer_input_crops(batch, model_cfg, crops_dir, frame_path.stem)
+                    batch = recursive_to(batch, device)
+                    with torch.no_grad(), cap.amp_ctx():
+                        out = model(batch)
+                    _save_batch(out, batch, [frame_path.stem] * int(batch['img'].shape[0]))
+        else:
+            # 크롭 준비(cv2.imread + ViTDetDataset 리사이즈/정규화)가 배치 후 HaMeR 의 주 병목.
+            # cv2/numpy 는 GIL 을 해제하므로 스레드풀로 프레임을 병렬 처리(크롭 자체는 동일 → 출력 동일).
+            # CAP_HAMER_WORKERS=0/1 이면 순차(되돌리기). verbose(오버레이 저장)는 스레드 비안전이라 순차.
+            def _crop_one(args):
+                frame_idx, frame_path = args
+                img_cv2 = cv2.imread(str(frame_path))
+                if img_cv2 is None:
+                    return []
+                boxes, right = _boxes_for_frame(frame_idx, img_cv2)
+                if not boxes:
+                    return []
+                boxes_np = np.asarray(boxes, dtype=np.float32)
+                right_np = np.asarray(right, dtype=np.float32)
+                ds = ViTDetDataset(model_cfg, img_cv2, boxes_np, right_np, rescale_factor=rescale_factor)
+                return [(frame_path.stem, ds[i]) for i in range(len(ds))]
 
-            boxes_np = np.asarray(boxes, dtype=np.float32)
-            right_np = np.asarray(right, dtype=np.float32)
-
-            dataset = ViTDetDataset(model_cfg, img_cv2, boxes_np, right_np, rescale_factor=rescale_factor)
-            dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-
-            for batch in dataloader:
-                if save_crops:
-                    save_hamer_input_crops(batch, model_cfg, crops_dir, frame_path.stem)
-            
+            jobs_list = list(enumerate(frame_paths[:total]))
+            n_workers = max(0, int(os.environ.get('CAP_HAMER_WORKERS', '4')))
+            samples = []  # (frame_stem, item_dict) — 프레임 순서 보존
+            if n_workers > 1 and not verbose:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=n_workers) as _ex:
+                    for res in tqdm(_ex.map(_crop_one, jobs_list), total=len(jobs_list), desc='HaMeR-crop'):
+                        samples.extend(res)
+            else:
+                for args in tqdm(jobs_list, desc='HaMeR-crop'):
+                    samples.extend(_crop_one(args))
+            from torch.utils.data.dataloader import default_collate
+            for s in tqdm(range(0, len(samples), cross_batch), desc='HaMeR'):
+                chunk = samples[s:s + cross_batch]
+                stems = [c[0] for c in chunk]
+                batch = default_collate([c[1] for c in chunk])
                 batch = recursive_to(batch, device)
-            
-                with torch.no_grad():
+                with torch.no_grad(), cap.amp_ctx():
                     out = model(batch)
-            
-                if not globals().get("_HAMER_OUT_KEYS_PRINTED", False):
-                    print("[DEBUG] HaMeR out type:", type(out))
-            
-                    if hasattr(out, "keys"):
-                        print("[DEBUG] HaMeR out keys:", list(out.keys()))
-            
-                        for k, v in out.items():
-                            shape = getattr(v, "shape", None)
-                            dtype = getattr(v, "dtype", None)
-                            print(f"[DEBUG] key={k}, type={type(v)}, shape={shape}, dtype={dtype}")
-            
-                            if isinstance(v, dict):
-                                print(f"[DEBUG] nested keys for {k}: {list(v.keys())}")
-                                for kk, vv in v.items():
-                                    vv_shape = getattr(vv, "shape", None)
-                                    vv_dtype = getattr(vv, "dtype", None)
-                                    print(
-                                        f"    [DEBUG] {k}.{kk}: "
-                                        f"type={type(vv)}, shape={vv_shape}, dtype={vv_dtype}"
-                                    )
-                    else:
-                        print("[DEBUG] HaMeR out has no keys()")
-            
-                    globals()["_HAMER_OUT_KEYS_PRINTED"] = True
-            
-                pred_cam = out['pred_cam'].detach().clone()
-                pred_cam[:, 1] = (2 * batch['right'] - 1) * pred_cam[:, 1]
-                box_center = batch['box_center'].float()
-                box_size = batch['box_size'].float()
-                img_size = batch['img_size'].float()
-                scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
-                pred_cam_t_full = cam_crop_to_full(pred_cam, box_center, box_size, img_size, scaled_focal_length)
-
-                for n in range(batch['img'].shape[0]):
-                    person_id = int(batch['personid'][n])
-                    right_flag = int(float(batch['right'][n].detach().cpu().numpy()))
-                    np.savez(
-                        out_dir / f'{frame_path.stem}_{person_id}.npz',
-                        vertices=out['pred_vertices'][n].detach().cpu().numpy(),
-                        keypoints_3d=out['pred_keypoints_3d'][n].detach().cpu().numpy(),
-                        keypoints_2d=out['pred_keypoints_2d'][n].detach().cpu().numpy(),
-                        cam_t=out['pred_cam_t'][n].detach().cpu().numpy(),
-                        cam_t_full=pred_cam_t_full[n].detach().cpu().numpy(),
-                        pred_cam=pred_cam[n].detach().cpu().numpy(),
-                        box_center=box_center[n].detach().cpu().numpy(),
-                        box_size=box_size[n].detach().cpu().numpy(),
-                        img_size=img_size[n].detach().cpu().numpy(),
-                        focal_length=np.asarray(scaled_focal_length.detach().cpu().item(), dtype=np.float32),
-                        mano_params={k: v[n].detach().cpu().numpy() for k, v in out['pred_mano_params'].items()},
-                        is_right=right_flag,
-                    )
-                    saved += 1
+                _save_batch(out, batch, stems)
 
         if total == 0:
             raise RuntimeError(f'No frames or keypoints available for HaMeR: {frame_dir}')

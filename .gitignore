@@ -22,3 +22,22 @@ external/hamer/_DATA/vitpose_ckpts/
 *.egg-info/
 __pycache__/
 *.pyc
+
+# --- session cleanup (2026-06-04) ---
+*.mp4
+*.zip
+*.patch
+*.bak
+*.bak_*
+.claude/
+_archive_session_diag/
+archive/
+batch_inputs/
+downloads/
+v4_generalization/
+*.png
+!poster/*.png
+*.log
+*.tar.gz
+*.gz
+external/hamer/_DATA/
